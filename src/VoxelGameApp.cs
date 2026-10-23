@@ -4,25 +4,31 @@ using Microsoft.Xna.Framework.Input;
 using VoxelGame.Blocks;
 using VoxelGame.Entities;
 using VoxelGame.Input;
+using VoxelGame.Items;
 using VoxelGame.Persistence;
 using VoxelGame.Rendering;
+using VoxelGame.Settings;
 using VoxelGame.Terrain;
+using VoxelGame.UI;
+using VoxelGame.UI.Screens;
 
 namespace VoxelGame;
 
 /// <summary>Top-level game class: owns the major systems and calls them in order each frame.</summary>
 public sealed class VoxelGameApp : Game
 {
-    private const int RenderDistance = 8;       // in chunks
-    private const float MouseSensitivity = 0.0025f;
+    private const float MouseSensitivity = 0.0025f;   // radians per pixel at 100%
     private const double AutosaveSeconds = 30;
 
     private readonly GraphicsDeviceManager _graphics;
     private readonly InputState _input = new();
+    private readonly InputState _noInput = new();      // never updated, so always "no keys pressed": fed to the player while a menu is open
     private readonly Camera _camera = new();
-    private readonly BlockInteraction _interaction = new();
+    private readonly Inventory _inventory = new();
     private readonly DayNightCycle _sky = new();
     private readonly LaunchOptions _options;
+    private GameSettings _settings;
+    private BlockInteraction _interaction;
     private CelestialRenderer _celestials;
     private BlockOutlineRenderer _outline;
     private SpriteBatch _spriteBatch;
@@ -32,9 +38,17 @@ public sealed class VoxelGameApp : Game
     private WorldStorage _storage;
     private Player _player;
 
-    private bool _mouseCaptured = true;
+    private UiManager _ui;
+    private BlockIconAtlas _icons;
+    private PixelFont _font;
+    private Hud _hud;
+
     private double _titleTimer;
     private double _autosaveTimer;
+    private bool _wasActive;
+    private bool _mouseGate = true;     // swallows the click that closed a menu, so it doesn't also break a block
+    private bool _iconsDirty = true;
+    private (int Slot, BlockType Block) _lastHeld;
 
     public VoxelGameApp(LaunchOptions options)
     {
@@ -56,17 +70,21 @@ public sealed class VoxelGameApp : Game
         _pixel = new Texture2D(GraphicsDevice, 1, 1);
         _pixel.SetData(new[] { Color.White });
 
+        _settings = GameSettings.Load(GameSettings.DefaultPath);
+        _settings.Clamp();
+        if (_options.Survival) _settings.GameMode = GameMode.Survival;
+
         _renderer = new WorldRenderer(GraphicsDevice, Content);
         _celestials = new CelestialRenderer(_spriteBatch, _pixel);
         _outline = new BlockOutlineRenderer(GraphicsDevice);
+        _interaction = new BlockInteraction(_inventory);
 
         // A new random world every launch, unless a seed is given. Worlds are saved by seed, so
         // launching with --seed=N again brings back that world with everything built or dug in it.
         int seed = _options.Seed ?? Random.Shared.Next();
         _storage = new WorldStorage(WorldStorage.DefaultRoot, seed);
         var level = _storage.LoadLevel();
-        _world = new World(GraphicsDevice, seed, RenderDistance, _storage);
-        _camera.FarPlane = (RenderDistance + 2) * Chunk.Size;
+        _world = new World(GraphicsDevice, seed, _settings.RenderDistance, _storage);
         Console.WriteLine($"World seed {seed}: {(level != null ? "loaded from" : "new, saves to")} {_storage.Directory}");
 
         if (level != null && level.GeneratorVersion != WorldGenerator.Version)
@@ -85,6 +103,7 @@ public sealed class VoxelGameApp : Game
             var (sx, sz) = _world.Generator.FindSpawn();
             _player = new Player(new Vector3(sx + 0.5f, _world.Generator.GetHeight(sx, sz) + 2, sz + 0.5f));
         }
+        LoadInventory(level);
 
         if (_options.Teleport is { } tp)
             _player.Position = new Vector3(tp.X + 0.5f, _world.Generator.GetHeight(tp.X, tp.Z) + 2, tp.Z + 0.5f);
@@ -101,52 +120,121 @@ public sealed class VoxelGameApp : Game
         _world.Update(_player.Position, int.MaxValue, int.MaxValue);
         if (level == null) MoveToClearSpot();
 
+        BuildUi();
+        ApplyFullscreen();   // start fullscreen if that was left on
         ApplyLaunchOptions();
     }
+
+    // ---- UI ----
+
+    private void BuildUi()
+    {
+        _font = PixelFont.Load(GraphicsDevice);
+        _icons = new BlockIconAtlas(GraphicsDevice);
+        _ui = new UiManager(_spriteBatch, new UiRenderer(_spriteBatch, _pixel, _font, _icons));
+        _hud = new Hud(_inventory);
+        _ui.Hud = _hud;
+        _ui.ScaleChanged += () => _iconsDirty = true;
+    }
+
+    private PauseActions MakePauseActions() => new()
+    {
+        SaveGame = () => { SaveWorld(force: true); _ui.ShowMessage("Game saved"); },
+        SaveAndQuit = Exit,   // OnExiting saves
+    };
+
+    private void OpenPause() => _ui.Open(new PauseScreen(_settings, MakePauseActions()));
+
+    private void ToggleInventory()
+    {
+        if (_ui.Top is InventoryScreen) _ui.CloseTop();
+        else if (!_ui.HasScreen) _ui.Open(new InventoryScreen(_inventory, _settings));
+    }
+
+    /// <summary>Starting items: a full hotbar of building blocks in creative, nothing in survival.</summary>
+    private void LoadInventory(LevelData level)
+    {
+        _inventory.Clear();
+        if (level?.Inventory != null)
+        {
+            _inventory.FromSaveData(level.Inventory.Select(s => (s.Slot, s.Block, s.Count)));
+            _inventory.SelectedSlot = Math.Clamp(level.SelectedSlot, 0, Inventory.HotbarSize - 1);
+        }
+        else if (_settings.GameMode == GameMode.Creative)
+        {
+            var starter = new[] { BlockType.Grass, BlockType.Dirt, BlockType.Stone, BlockType.Sand, BlockType.OakLog, BlockType.OakLeaves, BlockType.Lamp, BlockType.DimLamp, BlockType.Water };
+            for (int i = 0; i < starter.Length; i++) _inventory[i] = new ItemStack(starter[i], ItemStack.MaxCount);
+        }
+    }
+
+    // ---- Frame ----
 
     protected override void Update(GameTime gameTime)
     {
         float dt = Math.Min((float)gameTime.ElapsedGameTime.TotalSeconds, 0.05f);
 
+        // While a menu is open the mouse is a normal cursor; otherwise it is grabbed for looking around.
+        bool mouseGrabbed = !_ui.HasScreen && IsActive;
         var center = new Point(GraphicsDevice.Viewport.Width / 2, GraphicsDevice.Viewport.Height / 2);
-        _input.Update(_mouseCaptured && IsActive, center);
+        _input.Update(mouseGrabbed, center);
 
-        // The click that re-grabs the mouse must not also break a block.
-        bool canInteract = _mouseCaptured && IsActive;
+        // Switching to another window pauses the game, like most games do.
+        if (_wasActive && !IsActive && !_ui.HasScreen) OpenPause();
+        _wasActive |= IsActive;
 
-        // Escape frees the mouse; clicking the window grabs it again; Escape while free quits.
         if (_input.WasPressed(Keys.Escape))
         {
-            if (_mouseCaptured) _mouseCaptured = false;
-            else Exit();
+            if (!_ui.HandleEscape() && !_ui.HasScreen) OpenPause();
         }
-        else if (!_mouseCaptured && IsActive && _input.LeftClicked)
+        if (_input.WasPressed(Keys.E)) ToggleInventory();
+        if (_input.WasPressed(Keys.F3)) { _settings.ShowDebugText = !_settings.ShowDebugText; _settings.Save(GameSettings.DefaultPath); }
+        if (_input.WasPressed(Keys.F5)) ReloadAssets();   // edit blocks.png, tab back, press F5
+
+        if (_input.WasPressed(Keys.F11)) { _settings.Fullscreen = !_settings.Fullscreen; _settings.Save(GameSettings.DefaultPath); }
+
+        // Settings take effect straight away.
+        ApplyFullscreen();
+        _renderer.ShadowsEnabled = _settings.Shadows;
+        _world.SetRenderDistance(_settings.RenderDistance);
+        _camera.FarPlane = (_world.RenderDistance + 2) * Chunk.Size;
+        _camera.FieldOfView = MathHelper.ToRadians(_settings.FieldOfView);
+
+        _ui.Update(_input, dt, new Point(GraphicsDevice.Viewport.Width, GraphicsDevice.Viewport.Height), _settings.UiScale);
+        IsMouseVisible = _ui.HasScreen;
+
+        // After a menu closes, ignore the mouse until the button that closed it is let go.
+        if (_ui.HasScreen) _mouseGate = true;
+        else if (_mouseGate && !_input.LeftHeld && !_input.RightHeld) _mouseGate = false;
+
+        bool playing = !_ui.HasScreen && IsActive;                  // the player controls the character
+        bool simulating = !_ui.PausesGame;                          // the world moves on (not while paused)
+        var gameInput = playing ? _input : _noInput;
+
+        if (playing)
+            _camera.Rotate(-_input.MouseDelta.X * MouseSensitivity * _settings.MouseSensitivity / 100f,
+                           -_input.MouseDelta.Y * MouseSensitivity * _settings.MouseSensitivity / 100f);
+
+        if (simulating)
         {
-            _mouseCaptured = true;
+            _sky.Update(dt, playing && _input.IsKeyDown(Keys.T) ? 60f : 1f);   // hold T to fast-forward time
+
+            var previousXZ = new Vector2(_player.Position.X, _player.Position.Z);
+            _player.Update(dt, gameInput, _camera.Yaw, _world);
+            StirWater(previousXZ, dt);
+            if (_options.Rain) SprinkleRain(dt);
+
+            _interaction.Update(dt, gameInput, _camera, _world, _player, _settings.GameMode, playing && !_mouseGate);
+            _world.Tick(dt);   // water flow
         }
-        IsMouseVisible = !_mouseCaptured;
+        _world.Update(_player.Position, maxGenerate: 4, maxMesh: 4, timeBudgetMs: 6);
 
-        if (_mouseCaptured && IsActive)
-            _camera.Rotate(-_input.MouseDelta.X * MouseSensitivity, -_input.MouseDelta.Y * MouseSensitivity);
-
-        if (_input.WasPressed(Keys.F5)) _renderer.ReloadTextures();   // edit blocks.png, tab back, press F5
-
-        _sky.Update(dt, _input.IsKeyDown(Keys.T) ? 60f : 1f);   // hold T to fast-forward time
-
-        var previousXZ = new Vector2(_player.Position.X, _player.Position.Z);
-        _player.Update(dt, _input, _camera.Yaw, _world);
         _camera.Position = _player.EyePosition;
-        StirWater(previousXZ, dt);
-        if (_options.Rain) SprinkleRain(dt);
 
         // Is the camera under water? (Looking up at the surface from below, the water shader takes over.)
         var eye = _camera.Position;
         _renderer.CameraUnderwater = _world.WaterSurface((int)MathF.Floor(eye.X), (int)MathF.Floor(eye.Y), (int)MathF.Floor(eye.Z)) is { } surface && surface > eye.Y;
 
-        _interaction.Update(dt, _input, _camera, _world, _player, canInteract && _mouseCaptured);
-
-        _world.Update(_player.Position, maxGenerate: 2, maxMesh: 2);
-        _world.Tick(dt);   // water flow
+        UpdateHud();
 
         _autosaveTimer += gameTime.ElapsedGameTime.TotalSeconds;
         if (_autosaveTimer >= AutosaveSeconds)
@@ -159,33 +247,101 @@ public sealed class VoxelGameApp : Game
         base.Update(gameTime);
     }
 
+    private void UpdateHud()
+    {
+        _hud.DebugVisible = _settings.ShowDebugText;
+        if (_settings.ShowDebugText)
+        {
+            var p = _player.Position;
+            string biome = BiomeRegistry.Get(_world.Generator.GetBiomeAt((int)MathF.Floor(p.X), (int)MathF.Floor(p.Z))).Name;
+            _hud.DebugText =
+                $"{_fps} fps    seed {_world.Seed}    {_sky.Clock}\n" +
+                $"xyz {p.X:F1} {p.Y:F1} {p.Z:F1}\n" +
+                $"{biome}    chunks {_renderer.ChunksDrawn}/{_world.Chunks.Count}" +
+                (_player.IsFlying ? "    flying" : _player.IsSubmerged ? "    underwater" : _player.IsInWater ? "    swimming" : "");
+        }
+
+        // Show the name of what is in hand whenever it changes.
+        var held = (_inventory.SelectedSlot, _interaction.HeldBlock);
+        if (held != _lastHeld)
+        {
+            _lastHeld = held;
+            _hud.ShowItemName(held.Item2 == BlockType.Air ? "" : BlockRegistry.Get(held.Item2).Name);
+        }
+    }
+
+    private int _fps;
+    private double _fpsTimer;
+    private int _fpsFrames;
+
     protected override void Draw(GameTime gameTime)
     {
         float dt = (float)gameTime.ElapsedGameTime.TotalSeconds;
         _camera.AspectRatio = GraphicsDevice.Viewport.AspectRatio;
 
+        _fpsTimer += dt;
+        _fpsFrames++;
+        if (_fpsTimer >= 0.5) { _fps = (int)(_fpsFrames / _fpsTimer); _fpsTimer = 0; _fpsFrames = 0; }
+
+        // Block icons are drawn into a texture; redo them when the textures or UI scale change (this switches render targets).
+        if (_iconsDirty)
+        {
+            _icons.Rebuild(_renderer.BlockAtlas, 16 * _ui.Scale);
+            _iconsDirty = false;
+        }
+
         // The world is drawn off screen and copied to the window at the end; see WorldRenderer.
-        _renderer.Prepare(_world, _camera, _sky, dt);   // ripples and shadows: these switch render targets, so they go first
+        _renderer.Prepare(_world, _camera, _sky, _ui.PausesGame ? 0f : dt);   // ripples and shadows: these switch render targets, so they go first
         _renderer.BeginScene(_sky);
         if (!_renderer.CameraUnderwater) _celestials.Draw(_camera, _sky);
         _renderer.DrawTerrain(_world, _camera, _sky);
         _renderer.DrawWater(_world, _camera, _sky, _player.Position);
-        if (_interaction.Target is { } target) _outline.Draw(target, _camera);
+        if (_interaction.Target is { } target && !_ui.HasScreen) _outline.Draw(target, _camera);
         _renderer.Present();
 
-        DrawCrosshair();
+        _ui.Draw();
         base.Draw(gameTime);
     }
 
-    private void DrawCrosshair()
+    private bool _isFullscreen;
+    private Point _windowedSize = new(1280, 720);
+
+    /// <summary>
+    /// Switches between a window and borderless fullscreen at the desktop's resolution (no display-mode change, so
+    /// it is instant and alt-tab friendly). Remembers the window size to come back to.
+    /// </summary>
+    private void ApplyFullscreen()
     {
-        var vp = GraphicsDevice.Viewport;
-        int cx = vp.Width / 2, cy = vp.Height / 2;
-        _spriteBatch.Begin();
-        _spriteBatch.Draw(_pixel, new Rectangle(cx - 8, cy - 1, 16, 2), Color.White * 0.8f);
-        _spriteBatch.Draw(_pixel, new Rectangle(cx - 1, cy - 8, 2, 16), Color.White * 0.8f);
-        _spriteBatch.End();
+        if (_settings.Fullscreen == _isFullscreen) return;
+        _isFullscreen = _settings.Fullscreen;
+
+        if (_isFullscreen)
+        {
+            _windowedSize = new Point(_graphics.PreferredBackBufferWidth, _graphics.PreferredBackBufferHeight);
+            var screen = GraphicsAdapter.DefaultAdapter.CurrentDisplayMode;
+            _graphics.HardwareModeSwitch = false;
+            _graphics.PreferredBackBufferWidth = screen.Width;
+            _graphics.PreferredBackBufferHeight = screen.Height;
+        }
+        else
+        {
+            _graphics.PreferredBackBufferWidth = _windowedSize.X;
+            _graphics.PreferredBackBufferHeight = _windowedSize.Y;
+        }
+        _graphics.IsFullScreen = _isFullscreen;
+        _graphics.ApplyChanges();
     }
+
+    /// <summary>Re-reads the editable image files: block textures, water normals and the UI font.</summary>
+    private void ReloadAssets()
+    {
+        _renderer.ReloadTextures();
+        try { _font.Reload(GraphicsDevice); }
+        catch (Exception e) { Console.WriteLine($"Could not reload font: {e.Message}"); }
+        _iconsDirty = true;
+    }
+
+    // ---- Water ripples ----
 
     private readonly Random _rain = new(11);
     private float _rainTimer;
@@ -198,7 +354,7 @@ public sealed class VoxelGameApp : Game
         {
             _rainTimer -= 0.05f;
             var drop = new Vector2(_player.Position.X + (float)(_rain.NextDouble() * 28 - 14), _player.Position.Z + (float)(_rain.NextDouble() * 28 - 14));
-            _renderer.Ripples.Disturb(drop, drop, 0.5f, 0.35f);
+            _renderer.Ripples.Disturb(drop, drop, 0.4f, 0.2f);
         }
     }
 
@@ -213,7 +369,7 @@ public sealed class VoxelGameApp : Game
         var now = new Vector2(_player.Position.X, _player.Position.Z);
 
         if (_player.JustEnteredWater)
-            _renderer.Ripples.Disturb(now, now, 1.4f, Math.Min(0.08f * _player.EntrySpeed, 0.7f));
+            _renderer.Ripples.Disturb(now, now, 0.9f, Math.Min(0.05f * _player.EntrySpeed, 0.3f));
 
         // Feet touching water is enough: walking through shallows makes ripples too.
         bool touching = _player.WaterSurfaceY > _player.Position.Y + 0.02f;
@@ -224,11 +380,11 @@ public sealed class VoxelGameApp : Game
         float speed = (now - previousXZ).Length() / dt;
 
         // The wake is pushed a little ahead of the swimmer, so the bow ripples are in front of the camera, not under it.
-        float wake = Math.Min(speed * 0.045f, 0.16f) * nearSurface;
-        if (wake > 0.02f)
+        float wake = Math.Min(speed * 0.02f, 0.07f) * nearSurface;
+        if (wake > 0.01f)
         {
-            var ahead = (now - previousXZ) / Math.Max((now - previousXZ).Length(), 1e-4f) * 1.4f;
-            _renderer.Ripples.Disturb(previousXZ + ahead, now + ahead, 1.0f, wake);
+            var ahead = (now - previousXZ) / Math.Max((now - previousXZ).Length(), 1e-4f) * 1.0f;
+            _renderer.Ripples.Disturb(previousXZ + ahead, now + ahead, 0.55f, wake);
         }
 
         // Treading water: the body bobbing leaves a slow ring every so often.
@@ -236,14 +392,19 @@ public sealed class VoxelGameApp : Game
         if (_player.IsInWater && chestDepth < 0.4f && _treadTimer > 0.7f)
         {
             _treadTimer = 0f;
-            _renderer.Ripples.Disturb(now, now, 1.2f, 0.10f);
+            _renderer.Ripples.Disturb(now, now, 0.8f, 0.045f);
         }
     }
 
-    /// <summary>Writes changed chunks and the level file. A brand-new world nobody has touched is not saved.</summary>
-    private void SaveWorld()
+    // ---- Saving ----
+
+    /// <summary>
+    /// Writes changed chunks and the level file. A brand-new world nobody has touched is not saved,
+    /// unless <paramref name="force"/> is set (the player asked to save).
+    /// </summary>
+    private void SaveWorld(bool force = false)
     {
-        if (!_storage.Exists && !_world.HasBeenModified) return;
+        if (!force && !_storage.Exists && !_world.HasBeenModified) return;
 
         _world.SaveModifiedChunks();
         _storage.SaveLevel(new LevelData
@@ -257,14 +418,19 @@ public sealed class VoxelGameApp : Game
             Yaw = _camera.Yaw,
             Pitch = _camera.Pitch,
             Flying = _player.IsFlying,
+            Inventory = _inventory.ToSaveData().Select(s => new InventorySlotData { Slot = s.Slot, Block = s.Block, Count = s.Count }).ToList(),
+            SelectedSlot = _inventory.SelectedSlot,
         });
     }
 
     protected override void OnExiting(object sender, ExitingEventArgs args)
     {
         SaveWorld();
+        _settings.Save(GameSettings.DefaultPath);
         base.OnExiting(sender, args);
     }
+
+    // ---- Start-up helpers ----
 
     private bool Solid(int x, int y, int z) => BlockRegistry.Get(_world.GetBlock(x, y, z)).IsSolid;
 
@@ -303,9 +469,16 @@ public sealed class VoxelGameApp : Game
             int lx = (int)MathF.Floor(_player.Position.X), lz = (int)MathF.Floor(_player.Position.Z) - 3;
             _world.SetBlock(lx, _world.Generator.GetHeight(lx, lz) + 1, lz, BlockType.Lamp);
         }
+
+        switch (_options.Screen)
+        {
+            case "inventory": ToggleInventory(); break;
+            case "pause": OpenPause(); break;
+            case "settings": OpenPause(); _ui.Open(new SettingsScreen(_settings)); break;
+        }
     }
 
-    // No font asset yet, so debug info goes in the window title.
+    /// <summary>The window title mirrors the debug text, which is handy when the window is minimised or for scripts.</summary>
     private void UpdateTitle(GameTime gameTime)
     {
         _titleTimer += gameTime.ElapsedGameTime.TotalSeconds;
@@ -313,12 +486,12 @@ public sealed class VoxelGameApp : Game
         _titleTimer = 0;
 
         var p = _player.Position;
-        int fps = (int)(1.0 / Math.Max(gameTime.ElapsedGameTime.TotalSeconds, 0.0001));
-        Window.Title = $"VoxelGame | seed {_world.Seed} | {_sky.Clock} | {fps} fps | pos {p.X:F1}, {p.Y:F1}, {p.Z:F1} | " +
+        Window.Title = $"VoxelGame | seed {_world.Seed} | {_sky.Clock} | {_fps} fps | pos {p.X:F1}, {p.Y:F1}, {p.Z:F1} | " +
                        $"chunks {_renderer.ChunksDrawn}/{_world.Chunks.Count} | " +
-                       $"{BiomeRegistry.Get(_world.Generator.GetBiome((int)MathF.Floor(p.X), (int)MathF.Floor(p.Z))).Name} | " +
-                       $"holding {BlockRegistry.Get(_interaction.SelectedBlock).Name}" +
-                       (_player.IsFlying ? " | FLYING" : "") + (_player.IsSubmerged ? " | UNDERWATER" : _player.IsInWater ? " | SWIMMING" : "");
+                       $"{BiomeRegistry.Get(_world.Generator.GetBiomeAt((int)MathF.Floor(p.X), (int)MathF.Floor(p.Z))).Name} | " +
+                       $"holding {(_interaction.HeldBlock == BlockType.Air ? "nothing" : BlockRegistry.Get(_interaction.HeldBlock).Name)}" +
+                       (_player.IsFlying ? " | FLYING" : "") + (_player.IsSubmerged ? " | UNDERWATER" : _player.IsInWater ? " | SWIMMING" : "") +
+                       (_ui.HasScreen ? " | MENU" : "");
     }
 
     protected override void UnloadContent()
@@ -326,6 +499,8 @@ public sealed class VoxelGameApp : Game
         foreach (var chunk in _world.Chunks) chunk.Dispose();
         _renderer.Dispose();
         _outline.Dispose();
+        _icons.Dispose();
+        _font.Dispose();
         base.UnloadContent();
     }
 }

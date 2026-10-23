@@ -12,6 +12,8 @@ namespace VoxelGame;
 ///   --lift=N      start N blocks higher than the ground (combine with --fly to hover)
 ///   --rain        sprinkle raindrop ripples on any water near the player (to test ripples)
 ///   --spill       place a water source in mid-air in front of the player, to watch it pour and spread
+///   --screen=NAME open a menu at start: inventory, pause or settings
+///   --survival    start in survival mode (blocks are collected and used up)
 ///   --lamp        place a lamp on the ground in front of the spawn point
 /// </summary>
 public sealed class LaunchOptions
@@ -26,6 +28,8 @@ public sealed class LaunchOptions
     public float? Lift { get; private set; }
     public bool Rain { get; private set; }
     public bool Spill { get; private set; }
+    public string Screen { get; private set; }
+    public bool Survival { get; private set; }
     public bool Lamp { get; private set; }
 
     public static LaunchOptions Parse(string[] args)
@@ -56,6 +60,8 @@ public sealed class LaunchOptions
                 case "lift" when hasValue: options.Lift = value; break;
                 case "rain": options.Rain = true; break;
                 case "spill": options.Spill = true; break;
+                case "screen" when hasValue: options.Screen = parts[1].ToLowerInvariant(); break;
+                case "survival": options.Survival = true; break;
                 case "lamp": options.Lamp = true; break;
             }
         }

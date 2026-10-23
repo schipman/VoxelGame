@@ -23,6 +23,11 @@ public sealed class InputState
 
     public bool ToggleFlyPressed => WasPressed(Keys.F);
 
+    /// <summary>Mouse position in window pixels (only meaningful while the mouse is free, i.e. when a menu is open).</summary>
+    public Point MousePosition => new(_mouse.X, _mouse.Y);
+
+    public bool ShiftHeld => _keys.IsKeyDown(Keys.LeftShift) || _keys.IsKeyDown(Keys.RightShift);
+
     public bool LeftHeld => _mouse.LeftButton == ButtonState.Pressed;
     public bool RightHeld => _mouse.RightButton == ButtonState.Pressed;
 

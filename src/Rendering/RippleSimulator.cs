@@ -52,7 +52,7 @@ public sealed class RippleSimulator : IDisposable
         // Wave speed: (c * dt / texel)^2 with c = 6 blocks/second. Must stay below 0.5 to be stable.
         float texelsPerStep = 6f * StepSeconds / (WorldSize / Resolution);
         _effect.Parameters["WaveSpeed"].SetValue(texelsPerStep * texelsPerStep);
-        _effect.Parameters["Damping"].SetValue(0.992f);
+        _effect.Parameters["Damping"].SetValue(0.985f);
     }
 
     private RenderTarget2D CreateTarget() =>

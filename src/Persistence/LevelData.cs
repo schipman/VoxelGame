@@ -16,4 +16,16 @@ public sealed class LevelData
     public float Yaw { get; set; }
     public float Pitch { get; set; }
     public bool Flying { get; set; }
+
+    /// <summary>The non-empty inventory slots. Null in worlds saved before the inventory existed.</summary>
+    public List<InventorySlotData> Inventory { get; set; }
+    public int SelectedSlot { get; set; }
+}
+
+/// <summary>One inventory slot in the level file. The block is stored by name so saves survive new blocks being added.</summary>
+public sealed class InventorySlotData
+{
+    public int Slot { get; set; }
+    public string Block { get; set; }
+    public int Count { get; set; }
 }

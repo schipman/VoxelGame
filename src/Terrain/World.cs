@@ -18,7 +18,7 @@ public sealed class World
     private readonly List<Point> _offsets;   // chunk offsets around the player, nearest first
     private readonly List<Point> _unloadScratch = new();
 
-    public int RenderDistance { get; }
+    public int RenderDistance { get; private set; }
     public IReadOnlyCollection<Chunk> Chunks => _chunks.Values;
     public WorldGenerator Generator { get; }
     public LightingEngine Lighting { get; }
@@ -36,12 +36,21 @@ public sealed class World
         Generator = new WorldGenerator(seed);
         Lighting = new LightingEngine(this);
         Fluids = new FluidSimulator(this);
-        RenderDistance = renderDistance;
+        _offsets = new List<Point>();
+        SetRenderDistance(renderDistance);
+    }
+
+    /// <summary>Changes how far (in chunks) the world is loaded and drawn. Takes effect over the next few frames.</summary>
+    public void SetRenderDistance(int chunks)
+    {
+        chunks = Math.Max(2, chunks);
+        if (chunks == RenderDistance && _offsets.Count > 0) return;
+        RenderDistance = chunks;
 
         // Two extra rings are generated (but not meshed): a mesh samples blocks and light from all 8
         // surrounding chunks (smooth lighting and ambient occlusion look one block past every edge).
-        int r = renderDistance + 2;
-        _offsets = new List<Point>();
+        int r = chunks + 2;
+        _offsets.Clear();
         for (int dx = -r; dx <= r; dx++)
             for (int dz = -r; dz <= r; dz++)
                 if (dx * dx + dz * dz <= r * r)
@@ -156,18 +165,26 @@ public sealed class World
     // ---- Streaming ----
 
     /// <summary>
-    /// Generates, meshes and unloads chunks around a position. The budgets cap the work done per call
-    /// so the frame rate stays smooth; pass int.MaxValue to load everything at once (e.g. at startup).
+    /// Generates, meshes and unloads chunks around a position. The budgets cap the work done per call so the frame
+    /// rate stays smooth: at most maxGenerate new chunks and maxMesh meshes, and no more than timeBudgetMs of work
+    /// (checked after each chunk, so one chunk can overshoot a little). Pass int.MaxValue and no time budget to
+    /// load everything at once, e.g. at startup.
     /// </summary>
-    public void Update(Vector3 center, int maxGenerate, int maxMesh)
+    /// <remarks>
+    /// The time budget matters because MonoGame stops drawing when Update can't keep up with 60 calls a second, so a
+    /// fixed number of chunks per frame can freeze the picture whenever chunks are expensive.
+    /// </remarks>
+    public void Update(Vector3 center, int maxGenerate, int maxMesh, double timeBudgetMs = double.MaxValue)
     {
+        var clock = System.Diagnostics.Stopwatch.StartNew();
+
         int cx = (int)MathF.Floor(center.X) >> 4;
         int cz = (int)MathF.Floor(center.Z) >> 4;
 
         int generated = 0;
         foreach (var o in _offsets)
         {
-            if (generated >= maxGenerate) break;
+            if (generated >= maxGenerate || (generated > 0 && clock.Elapsed.TotalMilliseconds > timeBudgetMs)) break;
             var key = new Point(cx + o.X, cz + o.Y);
             if (_chunks.ContainsKey(key)) continue;
 
@@ -186,7 +203,7 @@ public sealed class World
         int rd2 = RenderDistance * RenderDistance;
         foreach (var o in _offsets)
         {
-            if (meshed >= maxMesh) break;
+            if (meshed >= maxMesh || (meshed > 0 && clock.Elapsed.TotalMilliseconds > timeBudgetMs)) break;
             if (o.X * o.X + o.Y * o.Y > rd2) continue;
             if (!_chunks.TryGetValue(new Point(cx + o.X, cz + o.Y), out var chunk)) continue;
             if (!chunk.NeedsMesh || !HasAllNeighbours(chunk)) continue;

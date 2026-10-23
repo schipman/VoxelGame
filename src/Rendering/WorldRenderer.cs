@@ -37,6 +37,13 @@ public sealed class WorldRenderer : IDisposable
     private float _time;
 
     public RippleSimulator Ripples { get; }
+
+    /// <summary>The block texture atlas (the UI draws block icons from it).</summary>
+    public Texture2D BlockAtlas => _atlas;
+
+    /// <summary>Turn the sun's shadows off. Everything the sun reaches is then fully lit.</summary>
+    public bool ShadowsEnabled { get; set; } = true;
+    private bool _shadowMapCleared;
     public int ChunksDrawn { get; private set; }
 
     /// <summary>True when the camera is under water: everything gets the murky underwater fog.</summary>
@@ -67,8 +74,19 @@ public sealed class WorldRenderer : IDisposable
         _lightViewProjection = BuildLightMatrix(camera, sky);
 
         // At dusk and dawn the light is ~0, so skip the shadow pass entirely.
-        if (sky.LightColor.LengthSquared() > 1e-4f)
+        if (ShadowsEnabled && sky.LightColor.LengthSquared() > 1e-4f)
+        {
             DrawShadowMap(world);
+            _shadowMapCleared = false;
+        }
+        else if (!ShadowsEnabled && !_shadowMapCleared)
+        {
+            // An all-white map means "nothing blocks the sun anywhere".
+            _device.SetRenderTarget(_shadowMap);
+            _device.Clear(Color.White);
+            _device.SetRenderTarget(null);
+            _shadowMapCleared = true;
+        }
     }
 
     /// <summary>Stage 2.</summary>
@@ -151,7 +169,7 @@ public sealed class WorldRenderer : IDisposable
         Set(effect, "RefractionStrength", 0.8f);
         Set(effect, "RippleWorldSize", RippleSimulator.WorldSize);
         Set(effect, "RippleTexel", 1f / RippleSimulator.Resolution);
-        Set(effect, "RippleStrength", 6f);
+        Set(effect, "RippleStrength", 3f);
         Set(effect, "PlayerPosition", playerPosition);
         Set(effect, "RippleFadeStart", 14f);
         Set(effect, "RippleFadeEnd", 22f);

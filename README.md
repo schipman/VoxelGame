@@ -18,22 +18,75 @@ dotnet run
 | F | Toggle fly mode |
 | Left mouse | Break block (hold to repeat) |
 | Right mouse | Place selected block (hold to repeat) |
-| B / scroll wheel | Cycle through every block type to place (1-9 jump to the first nine) |
+| 1-9 / scroll wheel | Choose the hotbar slot |
+| B (creative) | Swap the held stack for the next block type (Shift+B: previous) |
+| E | Open or close the inventory |
+| F3 | Show or hide the debug text |
+| F11 | Toggle fullscreen (also in Settings) |
 | Shift+B | Cycle block selection backwards |
-| F5 | Reload the block atlas and water normal map from disk (see below) |
+| F5 | Reload the block atlas, water normal map and UI font from disk (see below) |
 | T (hold) | Fast-forward time of day (a full day is 10 minutes) |
-| Esc | Release mouse (press again to quit); click the window to grab it again |
+| Esc | Pause menu (or close the open menu). Switching to another window also pauses. |
 
-FPS, time of day, position and chunk counts are shown in the window title (no font asset yet).
+FPS, time of day, position and chunk counts are shown on screen (F3 to hide) and in the window title.
 
 Launch switches (see `src/LaunchOptions.cs`): `dotnet run -- --seed=1234 --time=0.5 --yaw=90 --pitch=-20 --lamp`
 
 More test switches: `--fly --lift=N` (hover N blocks above the ground), `--spill` (a waterfall appears in front of
-you), `--rain` (random ripples on nearby water).
+you), `--rain` (random ripples on nearby water), `--screen=inventory|pause|settings` (open a menu at start),
+`--survival` (start in survival mode).
 
 To visit a biome: `dotnet run -- --find=PaleGarden` or `--find=River` (any name from the table below, spaces optional),
 or `--tp=X,Z`.
 The window title shows the biome you are standing in.
+
+## User interface
+
+A small widget toolkit in `src/UI/`, plus the screens built from it. Everything is laid out in "UI pixels" and scaled up
+by a whole number (set automatically from the window size, or in Settings), so it stays crisp at any resolution.
+
+**Screens**
+- **HUD** (`Hud.cs`): crosshair, hotbar, the name of the held item, debug text, short messages. Always on.
+- **Inventory** (E): 3 rows of storage plus the hotbar. In creative mode a palette of every block sits above it.
+  Drag a stack to move it (left button: all, right button: half); dropping on the same item merges, on a different one
+  swaps. Shift-click sends a stack between the hotbar and the rest. Click a hotbar slot to hold it. Palette: drag to copy,
+  click to add a stack, drop an item onto it to delete it. Hover for a tooltip.
+- **Pause menu** (Esc): resume, settings, save, save and quit. The game stands still while it is open.
+- **Settings:** render distance, field of view, mouse sensitivity, UI scale, fullscreen (borderless, at the desktop resolution), shadows, debug text, game mode. Saved to
+  `%AppData%\VoxelGame\settings.json`.
+
+**Game modes** (Settings): *Creative* (default): nothing is used up, and the palette is available. *Survival*: breaking a
+block puts it in your inventory, placing uses one up, and you start with nothing.
+
+**Building your own screen.** Subclass `UiScreen`, add widgets to `Root`, and call `Ui.Open(screen)`:
+
+```csharp
+public sealed class HelloScreen : UiScreen
+{
+    public HelloScreen()
+    {
+        var window = Root.Add(new StackPanel { Background = true, Padding = 10, Spacing = 5, CenterChildren = true, Anchor = Anchor.Center });
+        window.Add(new Label("Hello!") { Scale = 2 });
+        window.Add(new Button("Close", () => Ui.CloseTop()));
+    }
+}
+```
+
+| Piece | What it is |
+|---|---|
+| `Widget` | Base class. Position (or `Anchor` + `Offset`), `Size`, children, mouse events, drag and drop hooks. |
+| `StackPanel`, `GridPanel` | Lay children out in a row, column or grid, and size themselves to fit. `Background = true` draws a window behind them. |
+| `Label`, `Button`, `Slider`, `CycleButton` | The standard controls. |
+| `ItemSlot` | A square holding a stack of items; reads and writes it through two functions, so it works for any container. |
+| `UiManager` | Routes the mouse: hover, press, click, scroll, and drag and drop (`BeginDrag` / `CanAcceptDrop` / `OnDrop`). Owns the screen stack. |
+| `UiTheme` | Every colour in one place. Use `UiTheme.Alpha` for see-through colours (sprites expect premultiplied alpha). |
+
+**Drag and drop** for your own widgets: override `BeginDrag` to return a `DragPayload` subclass (it draws the thing that
+follows the cursor), and override `CanAcceptDrop` and `OnDrop` on whatever should accept it. See `ItemSlot`.
+
+**Font:** `Assets/Textures/font.png`, a 16x6 grid of 8x8 characters (ASCII 32-127, white on transparent). Edit it and
+press F5. Character widths are measured from the pixels. **Block icons** in slots are drawn once from the real block textures
+(`BlockIconAtlas`) and redrawn when the textures or UI scale change.
 
 ## World generation and biomes
 
@@ -94,8 +147,9 @@ a copy of that image to work out what it is lying over:
 Edit or replace it and press F5.
 
 **Ripples** (`RippleSimulator`, `Ripples.fx`): a wave simulation running on the GPU on a map that wraps around the
-player. Swimming leaves a wake with foam in front of you, diving in makes a splash, treading water leaves slow rings,
-and walking through shallows ripples too. `--rain` shows raindrops. Call
+player. Swimming leaves a gentle wake in front of you, diving in makes a small splash, treading water leaves slow rings,
+and walking through shallows ripples too. They only bend the reflections (no foam); strengths and sizes are in
+`StirWater` (VoxelGameApp) and `RippleStrength` (WorldRenderer). `--rain` shows raindrops. Call
 `renderer.Ripples.Disturb(from, to, radius, strength)` to make ripples from anything else.
 
 **Swimming:** Space swims up, Shift dives, you float at the surface by yourself otherwise, and Space against a ledge climbs out.
@@ -187,6 +241,15 @@ src/
   Persistence/
     WorldStorage.cs      level.json + per-chunk files (palette + gzip, written atomically)
     LevelData.cs         what level.json holds
+  Items/
+    ItemStack.cs, Inventory.cs   stacks, 36-slot inventory, drag/drop transfer rules
+  Settings/
+    GameSettings.cs      options saved between sessions
+  UI/
+    Widget.cs, Layouts.cs, Controls.cs, ItemSlot.cs   the widget toolkit
+    UiManager.cs         mouse routing, drag and drop, screen stack
+    Hud.cs, Screens/     hotbar and crosshair; inventory, pause and settings menus
+    PixelFont.cs, UiRenderer.cs, UiTheme.cs
   Input/
     InputState.cs        keyboard/mouse -> game-level input
 ```
@@ -221,8 +284,8 @@ src/
 - [x] Player, camera, walking, jumping, collision
 - [x] Mining and placing blocks (DDA raycast, block outline, 5-block reach)
 - [x] Lighting: voxel sky/block light, ambient occlusion, moving sun with shadow map, day/night, lamps
-- [ ] UI: needs a SpriteFont (the content pipeline is now set up: add it to `Content/Content.mgcb`)
-- [ ] Inventory and hotbar
+- [x] UI toolkit: panels, buttons, sliders, item slots, drag and drop, pause and settings menus
+- [x] Inventory and hotbar (creative palette, survival collecting)
 - [x] Biomes: climate noise, 15 biomes, trees (see above)
 - [ ] Chopping trees down (logs and leaves exist; needs tool/break-time and drops)
 - [ ] Caves and ores

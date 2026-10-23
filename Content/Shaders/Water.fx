@@ -224,11 +224,6 @@ float4 WaterPS(VSOutput input) : COLOR0
     float foam = smoothstep(0.45, 0.75, pattern * 0.7 + shore * 0.55) * shore;
     color = lerp(color, float3(0.92, 0.96, 1.0) * (waterLight * 0.6 + 0.25), foam * 0.85);
 
-    // ---- Wake foam: where ripples are tall (a swimmer's wake, a splash, raindrops) the surface turns white-capped ----
-    float wakeFoam = smoothstep(0.05, 0.22, abs(rippleCentre)) * rippleFade * horizontal * (1.0 - below);
-    wakeFoam *= 0.5 + 0.5 * tex2D(NormalSampler, wp.xz * 1.3 - float2(Time * 0.03, 0.0)).b;
-    color = lerp(color, float3(0.92, 0.96, 1.0) * (waterLight * 0.6 + 0.3), wakeFoam * 0.7);
-
     // ---- Falling water: streaks of foam sliding down vertical faces (waterfalls and the walls of flowing water) ----
     float2 fallUV = float2(wp.x + wp.z, 0.0) * 0.35 + float2(0.0, wp.y * 0.22 + Time * 0.9);
     float streak = tex2D(NormalSampler, fallUV).b;
