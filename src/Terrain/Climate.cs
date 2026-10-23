@@ -39,15 +39,18 @@ public sealed class ClimateSampler
     // which keeps the biome thresholds (copied from Minecraft) meaningful.
     private const float Gain = 2.1f;
 
-    // Shifts continentalness toward land. With no water in the game yet, ocean basins are just big dry pits,
-    // so oceans are kept to a minority of the world.
-    private const float LandBias = 0.22f;
+    // Shifts continentalness toward land (positive) or sea (negative). Tuned so about a third of the world is ocean.
+    private const float LandBias = 0.0f;
 
     private readonly PerlinNoise _continentalness;
     private readonly PerlinNoise _erosion;
     private readonly PerlinNoise _weirdness;
     private readonly PerlinNoise _temperature;
     private readonly PerlinNoise _humidity;
+
+    // Perlin noise is exactly zero at its lattice points, including the origin, so without an offset every world would have
+    // the same climate at (0,0). Shifting each field by a seed-dependent amount makes the origin as varied as anywhere else.
+    private readonly float _offsetX, _offsetZ;
 
     public ClimateSampler(int seed)
     {
@@ -57,15 +60,23 @@ public sealed class ClimateSampler
         _weirdness       = new PerlinNoise(seed * 31 + 3);
         _temperature     = new PerlinNoise(seed * 31 + 4);
         _humidity        = new PerlinNoise(seed * 31 + 5);
+
+        uint h = TreeBuilder.Hash(seed, 0x0FF5, 0x3E7, 0xC11A);
+        _offsetX = 3000f + (h & 0xFFFF) / 65536f * 20000f;
+        _offsetZ = 3000f + (h >> 16) / 65536f * 20000f;
     }
 
+    /// <summary>Just the continentalness at a spot; cheaper than a full sample. Rivers use it to find the sea.</summary>
+    public float Continentalness(int x, int z) =>
+        Math.Clamp(Field(_continentalness, x, z, ContinentScale, 4) + LandBias, -1f, 1f);
+
     public Climate Sample(int x, int z) => new(
-        Math.Clamp(Field(_continentalness, x, z, ContinentScale, 4) + LandBias, -1f, 1f),
+        Continentalness(x, z),
         Field(_erosion,         x, z, ErosionScale, 3),
         Field(_weirdness,       x, z, WeirdnessScale, 3),
         Field(_temperature,     x, z, TemperatureScale, 2, 1.75f),
         Field(_humidity,        x, z, HumidityScale, 2, 1.75f));
 
-    private static float Field(PerlinNoise noise, int x, int z, float scale, int octaves, float gain = Gain) =>
-        Math.Clamp(noise.Fractal(x / scale, z / scale, octaves) * gain, -1f, 1f);
+    private float Field(PerlinNoise noise, int x, int z, float scale, int octaves, float gain = Gain) =>
+        Math.Clamp(noise.Fractal((x + _offsetX) / scale, (z + _offsetZ) / scale, octaves) * gain, -1f, 1f);
 }

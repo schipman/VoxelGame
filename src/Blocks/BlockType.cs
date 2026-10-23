@@ -40,4 +40,7 @@ public enum BlockType : byte
     DarkOakLeaves,
     PaleOakLeaves,
     AcaciaLeaves,
+
+    // Liquids
+    Water,
 }

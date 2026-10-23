@@ -12,15 +12,15 @@ dotnet run
 |---|---|
 | W A S D | Move |
 | Mouse | Look |
-| Space | Jump (fly mode: up) |
-| Left Shift | Fly mode: down |
+| Space | Jump (fly mode: up; swimming: swim up; at a ledge: climb out) |
+| Left Shift | Fly mode: down; dive when swimming |
 | Left Ctrl | Sprint |
 | F | Toggle fly mode |
 | Left mouse | Break block (hold to repeat) |
 | Right mouse | Place selected block (hold to repeat) |
 | B / scroll wheel | Cycle through every block type to place (1-9 jump to the first nine) |
 | Shift+B | Cycle block selection backwards |
-| F5 | Reload the block texture atlas from disk (see below) |
+| F5 | Reload the block atlas and water normal map from disk (see below) |
 | T (hold) | Fast-forward time of day (a full day is 10 minutes) |
 | Esc | Release mouse (press again to quit); click the window to grab it again |
 
@@ -28,7 +28,11 @@ FPS, time of day, position and chunk counts are shown in the window title (no fo
 
 Launch switches (see `src/LaunchOptions.cs`): `dotnet run -- --seed=1234 --time=0.5 --yaw=90 --pitch=-20 --lamp`
 
-To visit a biome: `dotnet run -- --find=PaleGarden` (any name from the table below, spaces optional), or `--tp=X,Z`.
+More test switches: `--fly --lift=N` (hover N blocks above the ground), `--spill` (a waterfall appears in front of
+you), `--rain` (random ripples on nearby water).
+
+To visit a biome: `dotnet run -- --find=PaleGarden` or `--find=River` (any name from the table below, spaces optional),
+or `--tp=X,Z`.
 The window title shows the biome you are standing in.
 
 ## World generation and biomes
@@ -61,18 +65,64 @@ Terrain follows the shape of Minecraft's generator (`src/Terrain/`):
 | Mountains | inland, rugged | grass, bare rock, snow cap | spruce, oak |
 | Stony Peaks / Snowy Peaks | inland, tallest ridges (warm / cold) | stone, gravel / snow | none |
 | Beach, Ocean | low continentalness | sand, gravel | none |
+| River | channels from highlands to the sea | gravel and sand bed, sandy banks | none |
+| Lake | flat inland ground: big deep lakes (14-32 blocks across) and small ponds (4-9) | sand and gravel bed, sandy rim | none |
 
-There is no water yet, so oceans are dry sand basins for now (about 13% of the world). Once water exists they fill up
-to sea level automatically. There are also no caves or ores yet.
+Oceans fill up to sea level (y=46) and cover about a third of the world (median depth 22 blocks, up to 44), with continents and islands in between. Rivers run down from the highlands to the coast, and lakes and ponds are scattered over flat inland ground. New worlds start on dry land within a short walk of water. There are no caves or ores yet.
 
 **Adding a biome:** add it to `Biome` and `BiomeRegistry` (name, ground blocks, tree list), then add a rule for where it
 occurs in `BiomeSource`. **Adding a tree:** add a `TreeKind` and a shape in `TreeBuilder`, new log/leaf blocks if needed.
-Worlds saved before this generator existed will show a warning: their edited chunks won't match the new terrain.
+Worlds saved with an older generator will show a warning: their edited chunks won't match the new terrain.
+
+## Water
+
+**Looks** (`Content/Shaders/Water.fx`, `Assets/Textures/water_normal.png`). The world is drawn first into an off-screen
+image that stores colour plus the distance from the camera. Water is then drawn on top, and each water pixel looks at
+a copy of that image to work out what it is lying over:
+- **Waves:** a few travelling sine waves move the surface vertices, and the lighting uses the waves' slopes.
+- **Normal maps:** a tiling normal map is read at three scales, scrolling in different directions. Sea water drifts
+  with the wind; river water slides along the river's flow direction.
+- **Refraction:** the view is bent along the surface normal. Samples that land on something nearer than the water are
+  rejected so objects in front don't smear into it.
+- **Absorption:** light fades with the distance it travels through water, red first, so shallows are turquoise and
+  depths go deep blue. The sea floor stays visible because underwater faces fade by depth rather than going black.
+- **Reflection and sun glints:** a sky gradient reflected by Fresnel, plus sharp glitter paths when the sun is low.
+- **Foam** at shallow edges, and **streaks** sliding down waterfalls.
+- **Caustics:** moving light patterns on anything under water (computed in `Voxel.fx` from the same normal map).
+- **Underwater:** murky fog, and the surface seen from below is a bright rippled ceiling.
+`water_normal.png` is a plain image like the block atlas: red/green = surface slope, blue = a pattern used for foam.
+Edit or replace it and press F5.
+
+**Ripples** (`RippleSimulator`, `Ripples.fx`): a wave simulation running on the GPU on a map that wraps around the
+player. Swimming leaves a wake with foam in front of you, diving in makes a splash, treading water leaves slow rings,
+and walking through shallows ripples too. `--rain` shows raindrops. Call
+`renderer.Ripples.Disturb(from, to, radius, strength)` to make ripples from anything else.
+
+**Swimming:** Space swims up, Shift dives, you float at the surface by yourself otherwise, and Space against a ledge climbs out.
+
+**Flow** (`FluidSimulator`): water blocks have a level: 0 is a source (never runs dry), 1-7 is flowing water that thins
+as it travels. Water falls into air below it, spreads sideways when resting on something solid, and dries up when
+nothing feeds it. Dig next to a lake and it pours in; remove a source and what it fed drains. Generated oceans and
+rivers are all source blocks, so they stay put until something nearby changes. Water is in the B-cycle: place it
+yourself. The simulation advances 5 times a second, and levels are saved with chunks.
+
+**Lakes and ponds** (`LakeField`): the world is cut into a grid and each cell decides from the seed alone whether it
+holds a lake, so chunks can be generated in any order. A lake is only placed on fairly flat, inland ground, and its
+water level is set a block below the lowest point of its rim so it can never spill. The shoreline wobbles with noise,
+and the bed is a smooth bowl, deepest in the middle. Ponds are the same thing, smaller and shallower, and much more common.
+
+**Rivers** (`RiverNetwork`): rivers start on high ground and flow downhill to the sea, forking near the coast like a
+delta. They are traced in big regions so they don't depend on chunk order: each region picks sources on its highest
+ground (and some in the foothills, so many rivers reach the sea) and follows the land downhill, steered by the slope,
+by the direction of the coast and by fractal noise that makes them meander. Rivers widen downstream. Each is carved
+into the terrain as a channel with banks, and filled with water that never rises as the river goes on. Rivers that
+don't reach the sea end in a pond.
 
 ## Block textures
 
 All block textures live in one image: `Assets/Textures/blocks.png` (256x256, a 16x16 grid of 16-pixel tiles,
-so 256 slots; 39 are used). Edit it in any image editor that handles PNG transparency. **While the game is running,
+so 256 slots; 39 are used). Edit it in any image editor that handles PNG transparency.
+The water normal map (`Assets/Textures/water_normal.png`) reloads the same way. **While the game is running,
 save the file and press F5** to see the change immediately (run the game from the project folder, e.g. `dotnet run`,
 so it reads this working copy; otherwise it reads the copy in `bin/`, refreshed on every build).
 
@@ -96,7 +146,9 @@ so it reads this working copy; otherwise it reads the copy in `bin/`, refreshed 
 
 ```
 Assets/Textures/blocks.png   the block texture atlas (edit me)
-Content/Shaders/Voxel.fx    terrain shader
+Content/Shaders/Voxel.fx    terrain shader (lighting, shadows, caustics)
+Content/Shaders/Water.fx    water surface shader
+Content/Shaders/Ripples.fx  ripple simulation step
 src/
   VoxelGameApp.cs        Game loop; owns and orders the systems
   LaunchOptions.cs       command-line test switches
@@ -107,6 +159,9 @@ src/
     Chunk.cs             16x128x16 block array + its GPU mesh
     World.cs             loaded chunks, Get/SetBlock in world coords, chunk streaming
     LightingEngine.cs    voxel light: sky + block light flood fill, incremental add/remove
+    FluidSimulator.cs    water flow: sources, falling, spreading, drying up
+    RiverNetwork.cs      rivers traced downhill from highlands to the sea
+    LakeField.cs         lakes and ponds scattered over flat inland ground
     WorldGenerator.cs    seed -> terrain: height shaping, surface rules, tree placement, biome/spawn search
     Climate.cs           the five climate noise fields (ClimateSampler)
     BiomeSource.cs       climate -> biome (Minecraft-style table)
@@ -117,9 +172,12 @@ src/
   Rendering/
     BlockOutlineRenderer.cs  wireframe around the targeted block
     TextureAtlas.cs      loads Assets/Textures/blocks.png; tile slot -> UV math
+    AssetFiles.cs        loads editable PNGs from disk
+    RippleSimulator.cs   GPU ripple wave simulation
+    FullscreenQuad.cs    draws a shader over a whole render target
     ChunkMesher.cs       blocks -> triangles; bakes smooth light + ambient occlusion per vertex
     VoxelVertex.cs       vertex format (position, normal, uv, light)
-    WorldRenderer.cs     shadow pass + main pass using Content/Shaders/Voxel.fx
+    WorldRenderer.cs     frame pipeline: shadows, scene, water (Voxel.fx, Water.fx), present
     DayNightCycle.cs     time of day -> sun direction, light/sky/ambient colours
     CelestialRenderer.cs sun, moon and stars sprites
   Entities/
@@ -167,8 +225,8 @@ src/
 - [ ] Inventory and hotbar
 - [x] Biomes: climate noise, 15 biomes, trees (see above)
 - [ ] Chopping trees down (logs and leaves exist; needs tool/break-time and drops)
-- [ ] Caves, ores, rivers and lakes (rivers/lakes need water)
-- [ ] Water (separate transparent mesh pass in `WorldRenderer`)
+- [ ] Caves and ores
+- [x] Water: waves, refraction, caustics, ripples, swimming, flowing water, rivers
 - [ ] Mobs and pathfinding (A* over the block grid)
 - [ ] Audio
 - [x] Saving/loading changed chunks, random seed per launch, `--seed` to reload a world
@@ -180,6 +238,8 @@ src/
 - Chunk files store block names, not numbers, so adding or reordering `BlockType` entries won't break old saves.
 - Chunk generation and meshing happen on the main thread (budgeted to 2 each per frame).
   Move them to worker threads when it starts to hitch.
+- Water reflects the sky and sun but not terrain or trees (no screen-space reflections yet), and has no biome tint.
+- Water doesn't make "infinite sources" from two adjacent sources, and doesn't push the player or items along.
 - Torches (non-cube, wall-mounted light sources) need a custom block shape; lamps are full cubes for now.
 - Light is white/warm only (one value per voxel, not RGB).
 - Mesh vertices use world coordinates; very far from the origin, float precision will cause jitter.

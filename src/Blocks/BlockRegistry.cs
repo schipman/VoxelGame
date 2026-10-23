@@ -61,7 +61,9 @@ public sealed record BlockDef(
     Tile Bottom,
     int LightEmission = 0,             // 0-15, the light level the block gives off
     bool CullsSameNeighbor = false,    // skip the face between two of these (leaves: hides the hollow inside a canopy)
-    bool DimsSkylight = false);        // sunlight passing straight down loses a level (leaves)
+    bool DimsSkylight = false,         // sunlight passing straight down loses a level (leaves, water)
+    int LightAbsorb = 0,               // extra light lost passing through, on top of the usual 1 per block (water)
+    bool IsLiquid = false);            // drawn by the water pass, flows, and can be swum in
 
 public static class BlockRegistry
 {
@@ -69,6 +71,8 @@ public static class BlockRegistry
     private static readonly bool[] Opaque = new bool[256];
     private static readonly bool[] CullsSame = new bool[256];
     private static readonly bool[] DimsSky = new bool[256];
+    private static readonly int[] Absorb = new int[256];
+    private static readonly bool[] Liquid = new bool[256];
 
     static BlockRegistry()
     {
@@ -103,6 +107,9 @@ public static class BlockRegistry
         Register(BlockType.DarkOakLeaves, Leaves("Dark Oak Leaves", Tile.DarkOakLeaves));
         Register(BlockType.PaleOakLeaves, Leaves("Pale Oak Leaves", Tile.PaleOakLeaves));
         Register(BlockType.AcaciaLeaves,  Leaves("Acacia Leaves",   Tile.AcaciaLeaves));
+
+        // Water has no texture of its own: the water shader draws it. It absorbs light, so the sea floor fades to dark.
+        Register(BlockType.Water, new BlockDef("Water", false, false, Tile.Stone, Tile.Stone, Tile.Stone, DimsSkylight: true, LightAbsorb: 1, IsLiquid: true));
     }
 
     // Shorthands for the common block shapes.
@@ -118,7 +125,9 @@ public static class BlockRegistry
         Defs[(int)type] = def;
         Opaque[(int)type] = def.IsOpaque;
         CullsSame[(int)type] = def.CullsSameNeighbor;
-        DimsSky[(int)type] = def.DimsSkylight;
+        DimsSky[(int)type] = def.DimsSkylight || def.LightAbsorb > 0;
+        Absorb[(int)type] = def.LightAbsorb;
+        Liquid[(int)type] = def.IsLiquid;
     }
 
     public static BlockDef Get(BlockType type) => Defs[(int)type];
@@ -127,4 +136,6 @@ public static class BlockRegistry
     public static bool IsOpaque(BlockType type) => Opaque[(int)type];
     public static bool CullsSameNeighbor(BlockType type) => CullsSame[(int)type];
     public static bool DimsSkylight(BlockType type) => DimsSky[(int)type];
+    public static int LightAbsorb(BlockType type) => Absorb[(int)type];
+    public static bool IsLiquid(BlockType type) => Liquid[(int)type];
 }

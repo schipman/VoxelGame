@@ -6,6 +6,8 @@ namespace VoxelGame.Terrain;
 public enum Biome : byte
 {
     Ocean,
+    River,
+    Lake,
     Beach,
     Plains,
     SnowyPlains,
@@ -47,6 +49,8 @@ public static class BiomeRegistry
     static BiomeRegistry()
     {
         Register(Biome.Ocean,       new("Ocean",        BlockType.Sand,       BlockType.Sand, 3));
+        Register(Biome.River,       new("River",        BlockType.Sand,       BlockType.Sand, 3));
+        Register(Biome.Lake,        new("Lake",         BlockType.Sand,       BlockType.Sand, 3));
         Register(Biome.Beach,       new("Beach",        BlockType.Sand,       BlockType.Sand, 3));
         Register(Biome.Plains,      new("Plains",       BlockType.Grass,      BlockType.Dirt, 3,
                                         TreeChance: 0.02f, Trees: new[] { (TreeKind.Oak, 1) }));

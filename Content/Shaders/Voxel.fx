@@ -1,10 +1,12 @@
 // Voxel terrain shader.
 //
-//   Technique "Main"   - draws chunk meshes with baked voxel light + sun/moon + shadows + fog.
+//   Technique "Main"   - draws chunk meshes with baked voxel light + sun/moon + shadows + fog + underwater caustics.
+//                        Alpha holds the distance from the camera, which the water pass uses to measure water depth.
 //   Technique "Shadow" - draws chunk meshes from the sun's point of view into the shadow map (depth only).
 //
-// Per-vertex light data arrives in the COLOR channel (all 0..1):
-//   R = sky light level   G = block light level   B = ambient occlusion   A = emissive (lamp faces)
+// Per-vertex data (all 0..1):
+//   COLOR0: R = sky light level   G = block light level   B = ambient occlusion   A = emissive (lamp faces)
+//   COLOR1: R = depth under water (blocks / 15; 0 = not underwater)   G = sky light at the water's surface
 
 #if OPENGL
     #define SV_POSITION POSITION
@@ -26,6 +28,7 @@ float3 BlockLightColor;     // tint of lamp light
 float3 FogColor;
 float FogStart;
 float FogEnd;
+float Time;                 // seconds, for animating caustics
 
 float ShadowMapSize;
 float ShadowBias;           // in normalised depth units
@@ -47,12 +50,21 @@ sampler2D ShadowSampler = sampler_state
     AddressU = Clamp; AddressV = Clamp;
 };
 
+Texture2D NormalMap;        // tiling water normal map; its wobble is what caustics are made from
+sampler2D NormalSampler = sampler_state
+{
+    Texture = <NormalMap>;
+    MinFilter = Linear; MagFilter = Linear; MipFilter = Linear;
+    AddressU = Wrap; AddressV = Wrap;
+};
+
 struct VSInput
 {
     float4 Position : POSITION0;
     float3 Normal   : NORMAL0;
     float2 TexCoord : TEXCOORD0;
     float4 Light    : COLOR0;
+    float4 Extra    : COLOR1;
 };
 
 struct VSOutput
@@ -62,6 +74,7 @@ struct VSOutput
     float4 Light    : TEXCOORD1;
     float3 Normal   : TEXCOORD2;
     float3 WorldPos : TEXCOORD3;
+    float4 Extra    : TEXCOORD4;
 };
 
 // ---------------------------------------------------------------- Main pass
@@ -74,6 +87,7 @@ VSOutput MainVS(VSInput input)
     output.Light = input.Light;
     output.Normal = input.Normal;
     output.WorldPos = input.Position.xyz;
+    output.Extra = input.Extra;
     return output;
 }
 
@@ -110,6 +124,26 @@ float ShadowFactor(float3 worldPos, float3 normal, float ndl)
     return lerp(1.0, lit, inside);
 }
 
+// Light focused by the rippling water surface above: bright, moving networks of lines on the sea floor.
+// The pack-style trick: the divergence of a scrolling normal map (how much the slopes converge) is where
+// light bunches up. Two layers at different scales and speeds make it look like it is never repeating.
+float Caustics(float3 worldPos, float3 normal)
+{
+    float2 plane = abs(normal.y) > 0.5 ? worldPos.xz : (abs(normal.x) > 0.5 ? worldPos.zy : worldPos.xy);
+
+    float2 uvA = plane * 0.12 + float2(Time * 0.020, Time * 0.013);
+    float2 uvB = plane * 0.07 - float2(Time * 0.014, Time * -0.019);
+    float e = 0.012;
+
+    float divA = (tex2D(NormalSampler, uvA + float2(e, 0)).r - tex2D(NormalSampler, uvA - float2(e, 0)).r)
+               + (tex2D(NormalSampler, uvA + float2(0, e)).g - tex2D(NormalSampler, uvA - float2(0, e)).g);
+    float divB = (tex2D(NormalSampler, uvB + float2(e, 0)).r - tex2D(NormalSampler, uvB - float2(e, 0)).r)
+               + (tex2D(NormalSampler, uvB + float2(0, e)).g - tex2D(NormalSampler, uvB - float2(0, e)).g);
+
+    float c = saturate(0.35 + (divA + divB) * 3.2);
+    return c * c * 2.2;
+}
+
 float4 MainPS(VSOutput input) : COLOR0
 {
     float4 tex = tex2D(BlockSampler, input.TexCoord);
@@ -121,17 +155,29 @@ float4 MainPS(VSOutput input) : COLOR0
 
     float3 N = normalize(input.Normal);
 
+    // Faces under water: the sky light baked into the mesh was dimmed block by block, which would make anything
+    // deeper than a few blocks pitch black. Instead fade the light at the surface smoothly with depth.
+    float waterDepth = input.Extra.r * 15.0;
+    float surfaceSky = input.Extra.g;
+    float submerged = step(0.5, waterDepth);
+    float depthFade = exp(-waterDepth * 0.09);
+    float skyLevel = lerp(sky, surfaceSky * depthFade, submerged);
+
     // Ambient sky light (flood-filled through the world, so caves and overhangs are dark).
     float hemisphere = lerp(0.7, 1.0, N.y * 0.5 + 0.5);
-    float3 ambient = AmbientColor * LightCurve(sky) * hemisphere;
+    float3 ambient = AmbientColor * LightCurve(skyLevel) * hemisphere;
 
     // Lamps.
     float3 lamps = BlockLightColor * LightCurve(blk);
 
     // Direct sun / moon light, cut by the shadow map and by the voxel sky exposure.
     float ndl = saturate(dot(N, LightDirection));
-    float exposure = smoothstep(0.55, 0.9, sky);
-    float3 direct = LightColor * ndl * ShadowFactor(input.WorldPos, N, ndl) * exposure;
+    float exposure = lerp(smoothstep(0.55, 0.9, sky), smoothstep(0.55, 0.9, surfaceSky) * exp(-waterDepth * 0.14), submerged);
+    float shadow = ShadowFactor(input.WorldPos, N, ndl);
+    float3 direct = LightColor * ndl * shadow * exposure;
+
+    // Caustics dance across lit surfaces under water, fading out with depth.
+    direct += LightColor * ndl * shadow * submerged * Caustics(input.WorldPos, N) * exp(-waterDepth * 0.2) * smoothstep(0.55, 0.9, surfaceSky);
 
     float3 light = (ambient + lamps + direct) * ao;
     light = lerp(light, float3(1.0, 1.0, 1.0), emissive);
@@ -140,7 +186,8 @@ float4 MainPS(VSOutput input) : COLOR0
 
     float dist = distance(input.WorldPos, CameraPosition);
     float fog = saturate((dist - FogStart) / (FogEnd - FogStart));
-    return float4(lerp(color, FogColor, fog), 1.0);
+    // Alpha carries the distance so the water pass can tell how far a ray travels through water.
+    return float4(lerp(color, FogColor, fog), dist);
 }
 
 technique Main

@@ -12,9 +12,12 @@ public readonly record struct BlockHit(int X, int Y, int Z, int NormalX, int Nor
 
 public static class VoxelRaycast
 {
+    private static bool IsTarget(World world, int x, int y, int z) => BlockRegistry.Get(world.GetBlock(x, y, z)).IsSolid;
+
     /// <summary>
-    /// Walks a ray through the block grid (Amanatides &amp; Woo DDA) and returns the first non-air block
-    /// within maxDistance, or null. Visits only the blocks the ray actually passes through.
+    /// Walks a ray through the block grid (Amanatides &amp; Woo DDA) and returns the first solid block
+    /// within maxDistance, or null. Water and air are looked through, so you can reach the bottom of a pond.
+    /// Visits only the blocks the ray actually passes through.
     /// </summary>
     public static BlockHit? Cast(World world, Vector3 origin, Vector3 direction, float maxDistance)
     {
@@ -25,7 +28,7 @@ public static class VoxelRaycast
         int z = (int)MathF.Floor(origin.Z);
 
         // Ray starts inside a block: report it with no face, so nothing can be placed against it.
-        if (world.GetBlock(x, y, z) != BlockType.Air) return new BlockHit(x, y, z, 0, 0, 0);
+        if (IsTarget(world, x, y, z)) return new BlockHit(x, y, z, 0, 0, 0);
 
         int stepX = Math.Sign(direction.X), stepY = Math.Sign(direction.Y), stepZ = Math.Sign(direction.Z);
         float tDeltaX = stepX == 0 ? float.MaxValue : 1f / MathF.Abs(direction.X);
@@ -47,7 +50,7 @@ public static class VoxelRaycast
             else                                     { t = tMaxZ; z += stepZ; tMaxZ += tDeltaZ; nz = -stepZ; }
 
             if (t > maxDistance) return null;
-            if (world.GetBlock(x, y, z) != BlockType.Air) return new BlockHit(x, y, z, nx, ny, nz);
+            if (IsTarget(world, x, y, z)) return new BlockHit(x, y, z, nx, ny, nz);
         }
     }
 }

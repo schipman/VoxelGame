@@ -13,7 +13,7 @@ namespace VoxelGame.Persistence;
 /// </summary>
 public sealed class WorldStorage
 {
-    private const int ChunkFileVersion = 1;
+    private const int ChunkFileVersion = 2;   // 2 added the fluid levels after the blocks
 
     /// <summary>Where all worlds live: %AppData%\VoxelGame\saves. Each world gets its own folder named after its seed.</summary>
     public static string DefaultRoot { get; } =
@@ -75,7 +75,7 @@ public sealed class WorldStorage
             using var reader = new BinaryReader(gzip);
 
             int version = reader.ReadInt32();
-            if (version != ChunkFileVersion) throw new InvalidDataException($"unknown chunk file version {version}");
+            if (version is < 1 or > ChunkFileVersion) throw new InvalidDataException($"unknown chunk file version {version}");
 
             // The palette lists block names, so saves survive reordering or adding BlockType entries.
             int paletteSize = reader.ReadByte();
@@ -92,6 +92,13 @@ public sealed class WorldStorage
             var blocks = new BlockType[indices.Length];
             for (int i = 0; i < indices.Length; i++) blocks[i] = palette[indices[i]];
             chunk.LoadBlocks(blocks);
+
+            if (version >= 2)
+            {
+                var fluid = new byte[indices.Length];
+                reader.BaseStream.ReadExactly(fluid);
+                chunk.LoadFluidLevels(fluid);
+            }
             return true;
         }
         catch (Exception e) when (e is IOException or InvalidDataException or IndexOutOfRangeException or EndOfStreamException)
@@ -131,6 +138,7 @@ public sealed class WorldStorage
             writer.Write((byte)palette.Count);
             foreach (var type in palette) writer.Write(type.ToString());
             writer.Write(indices);
+            writer.Write(chunk.FluidLevels);
         });
     }
 

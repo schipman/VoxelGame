@@ -23,10 +23,28 @@ public sealed class Player
     private const float MaxFallSpeed = 50f;
     private const float Epsilon = 1e-4f;
 
+    private const float SwimSpeed = 2.6f;
+    private const float SwimSprintSpeed = 3.6f;
+    private const float SwimVerticalSpeed = 3.6f;
+    private const float FloatDepth = 1.2f;     // when floating, the water line is this far above the player's feet (head and shoulders out)
+
     public Vector3 Position { get; set; }
     public Vector3 Velocity { get; private set; }
     public bool OnGround { get; private set; }
     public bool IsFlying { get; set; }
+
+    /// <summary>Water reaches at least the player's waist: they swim instead of walking.</summary>
+    public bool IsInWater { get; private set; }
+
+    /// <summary>The player's eyes are under water.</summary>
+    public bool IsSubmerged { get; private set; }
+
+    /// <summary>World height of the water surface around the player (negative infinity if there is none).</summary>
+    public float WaterSurfaceY { get; private set; } = float.NegativeInfinity;
+
+    /// <summary>True for the one frame in which the player entered the water; EntrySpeed is how fast they were falling.</summary>
+    public bool JustEnteredWater { get; private set; }
+    public float EntrySpeed { get; private set; }
 
     public Vector3 EyePosition => Position + new Vector3(0, EyeHeight, 0);
 
@@ -36,6 +54,7 @@ public sealed class Player
     }
 
     private World _world;
+    private bool _hitWall;   // bumped into something sideways during the last move
 
     public void Update(float dt, InputState input, float yaw, World world)
     {
@@ -49,12 +68,33 @@ public sealed class Player
         var wish = forward * input.Move.Y + right * input.Move.X;
         if (wish.LengthSquared() > 1) wish.Normalize();
 
+        bool wasInWater = IsInWater;
+        UpdateWaterState();
+        JustEnteredWater = IsInWater && !wasInWater;
+        EntrySpeed = JustEnteredWater ? MathF.Max(-Velocity.Y, 0f) : 0f;
+
         var v = Velocity;
         if (IsFlying)
         {
             float speed = input.Sprint ? FlySprintSpeed : FlySpeed;
             float vertical = (input.Jump ? 1 : 0) - (input.Sneak ? 1 : 0);
             v = wish * speed + Vector3.Up * vertical * speed;
+        }
+        else if (IsInWater)
+        {
+            // Swimming: slow, with little gravity. Space swims up, Shift dives; otherwise you float: a gentle spring
+            // eases you toward the height where your head and shoulders are out of the water.
+            float speed = input.Sprint ? SwimSprintSpeed : SwimSpeed;
+            v.X = wish.X * speed;
+            v.Z = wish.Z * speed;
+
+            float buoyancy = Math.Clamp((WaterSurfaceY - FloatDepth - Position.Y) * 3f, -1.5f, 1.8f);
+            float target = input.Jump ? SwimVerticalSpeed : input.Sneak ? -SwimVerticalSpeed : buoyancy;
+            v.Y = MoveToward(v.Y, target, 16f * dt);
+
+            // At the surface, jumping against a ledge hops you up onto it; otherwise you just tread water.
+            if (input.Jump && !IsSubmerged)
+                v.Y = _hitWall ? MathF.Max(v.Y, 6.5f) : MoveToward(v.Y, 0.5f, 16f * dt);
         }
         else
         {
@@ -67,10 +107,26 @@ public sealed class Player
         Velocity = v;
 
         OnGround = false;
+        _hitWall = false;
         MoveAxis(Axis.X, Velocity.X * dt);
         MoveAxis(Axis.Z, Velocity.Z * dt);
         MoveAxis(Axis.Y, Velocity.Y * dt);
     }
+
+    /// <summary>Finds out how deep in water the player is, from the water surface above their feet or waist.</summary>
+    private void UpdateWaterState()
+    {
+        int x = (int)MathF.Floor(Position.X), z = (int)MathF.Floor(Position.Z);
+        float? surface = _world.WaterSurface(x, (int)MathF.Floor(Position.Y + 0.1f), z)
+                      ?? _world.WaterSurface(x, (int)MathF.Floor(Position.Y + 0.6f), z);
+
+        WaterSurfaceY = surface ?? float.NegativeInfinity;
+        IsInWater = surface is { } s && s > Position.Y + 0.35f;
+        IsSubmerged = surface is { } s2 && s2 > Position.Y + EyeHeight;
+    }
+
+    private static float MoveToward(float value, float target, float maxDelta) =>
+        MathF.Abs(target - value) <= maxDelta ? target : value + MathF.Sign(target - value) * maxDelta;
 
     /// <summary>True if the player's box intersects the given block cell.</summary>
     public bool OverlapsBlock(int x, int y, int z)
@@ -107,10 +163,12 @@ public sealed class Player
         switch (axis)
         {
             case Axis.X:
+                _hitWall = true;
                 p.X = amount > 0 ? MathF.Floor(p.X + hw) - hw - Epsilon : MathF.Floor(p.X - hw) + 1 + hw + Epsilon;
                 vel.X = 0;
                 break;
             case Axis.Z:
+                _hitWall = true;
                 p.Z = amount > 0 ? MathF.Floor(p.Z + hw) - hw - Epsilon : MathF.Floor(p.Z - hw) + 1 + hw + Epsilon;
                 vel.Z = 0;
                 break;

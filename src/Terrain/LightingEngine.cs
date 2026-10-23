@@ -224,14 +224,15 @@ public sealed class LightingEngine
     private static int SpreadLevel(LightChannel channel, int direction, int level, BlockType target) =>
         channel == LightChannel.Sky && direction == Down
             ? SkyLevelBelow(level == MaxLight, level, target)
-            : level - 1;
+            : Math.Max(level - 1 - BlockRegistry.LightAbsorb(target), 0);
 
     /// <summary>
     /// Sky light of a cell directly below one with the given level: full-strength light stays full through
-    /// plain air, and drops one level through leaves; anything weaker fades one level per block.
+    /// plain air, and drops through leaves or water; anything weaker fades one level per block (plus whatever
+    /// the block itself absorbs: water takes two levels per block).
     /// </summary>
     private static int SkyLevelBelow(bool fullStrength, int levelAbove, BlockType cell) =>
-        fullStrength && !BlockRegistry.DimsSkylight(cell) ? MaxLight : Math.Max(levelAbove - 1, 0);
+        fullStrength && !BlockRegistry.DimsSkylight(cell) ? MaxLight : Math.Max(levelAbove - 1 - BlockRegistry.LightAbsorb(cell), 0);
 
     /// <summary>True if this cell would brighten at least one of its neighbours.</summary>
     private bool CanSpread(LightChannel channel, int x, int y, int z, int level)

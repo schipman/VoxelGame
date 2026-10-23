@@ -8,6 +8,10 @@ namespace VoxelGame;
 ///   --seed=N      world seed (default: a new random seed every launch). Reuse a seed to reload that world's saved edits.
 ///   --find=BIOME  start in the nearest biome of that name, e.g. --find=PaleGarden (new worlds only)
 ///   --tp=X,Z      start at those world coordinates
+///   --fly         start in fly mode (hover instead of falling)
+///   --lift=N      start N blocks higher than the ground (combine with --fly to hover)
+///   --rain        sprinkle raindrop ripples on any water near the player (to test ripples)
+///   --spill       place a water source in mid-air in front of the player, to watch it pour and spread
 ///   --lamp        place a lamp on the ground in front of the spawn point
 /// </summary>
 public sealed class LaunchOptions
@@ -18,6 +22,10 @@ public sealed class LaunchOptions
     public int? Seed { get; private set; }
     public Terrain.Biome? FindBiome { get; private set; }
     public (int X, int Z)? Teleport { get; private set; }
+    public bool Fly { get; private set; }
+    public float? Lift { get; private set; }
+    public bool Rain { get; private set; }
+    public bool Spill { get; private set; }
     public bool Lamp { get; private set; }
 
     public static LaunchOptions Parse(string[] args)
@@ -44,6 +52,10 @@ public sealed class LaunchOptions
                     var xz = parts[1].Split(',');
                     if (xz.Length == 2 && int.TryParse(xz[0], out int tx) && int.TryParse(xz[1], out int tz)) options.Teleport = (tx, tz);
                     break;
+                case "fly": options.Fly = true; break;
+                case "lift" when hasValue: options.Lift = value; break;
+                case "rain": options.Rain = true; break;
+                case "spill": options.Spill = true; break;
                 case "lamp": options.Lamp = true; break;
             }
         }

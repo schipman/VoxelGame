@@ -22,6 +22,7 @@ public sealed class World
     public IReadOnlyCollection<Chunk> Chunks => _chunks.Values;
     public WorldGenerator Generator { get; }
     public LightingEngine Lighting { get; }
+    public FluidSimulator Fluids { get; }
     public int Seed { get; }
 
     /// <summary>True once any block has been changed in this session; used to avoid saving untouched worlds.</summary>
@@ -34,6 +35,7 @@ public sealed class World
         Seed = seed;
         Generator = new WorldGenerator(seed);
         Lighting = new LightingEngine(this);
+        Fluids = new FluidSimulator(this);
         RenderDistance = renderDistance;
 
         // Two extra rings are generated (but not meshed): a mesh samples blocks and light from all 8
@@ -58,6 +60,27 @@ public sealed class World
         return chunk.Get(x & 15, y, z & 15);
     }
 
+    /// <summary>Fluid level at a position (0 = source block, 1-7 = flowing). Only meaningful where there is water.</summary>
+    public int GetFluidLevel(int x, int y, int z)
+    {
+        if (y < 0 || y >= Chunk.Height) return 0;
+        return _chunks.TryGetValue(new Point(x >> 4, z >> 4), out var chunk) ? chunk.GetFluidLevel(x & 15, y, z & 15) : 0;
+    }
+
+    public bool IsWater(int x, int y, int z) => BlockRegistry.IsLiquid(GetBlock(x, y, z));
+
+    /// <summary>
+    /// World height of the water surface above a position, or null if that cell isn't water.
+    /// Follows the column of water upward to its top, then takes that block's fluid height.
+    /// </summary>
+    public float? WaterSurface(int x, int y, int z)
+    {
+        if (!IsWater(x, y, z)) return null;
+        int top = y;
+        while (top + 1 < Chunk.Height && IsWater(x, top + 1, z)) top++;
+        return top + FluidSimulator.SurfaceHeight(GetFluidLevel(x, top, z));
+    }
+
     /// <summary>Block plus both light levels in one lookup; used by the mesher.</summary>
     public void GetCell(int x, int y, int z, out BlockType type, out int skyLight, out int blockLight)
     {
@@ -73,19 +96,27 @@ public sealed class World
         blockLight = chunk.GetBlockLight(lx, y, lz);
     }
 
-    public void SetBlock(int x, int y, int z, BlockType type)
+    /// <summary>
+    /// Changes a block, updating light, meshes, the save flag and any water nearby. For liquids, fluidLevel is
+    /// 0 for a source block or 1-7 for flowing water. Placing a block into water simply replaces it.
+    /// </summary>
+    public void SetBlock(int x, int y, int z, BlockType type, int fluidLevel = 0)
     {
         if (y < 0 || y >= Chunk.Height) return;
         if (!_chunks.TryGetValue(new Point(x >> 4, z >> 4), out var chunk)) return;
 
         int lx = x & 15, lz = z & 15;
-        if (chunk.Get(lx, y, lz) == type) return;
+        bool liquid = BlockRegistry.IsLiquid(type);
+        if (!liquid) fluidLevel = 0;
+        if (chunk.Get(lx, y, lz) == type && (!liquid || chunk.GetFluidLevel(lx, y, lz) == fluidLevel)) return;
 
         chunk.Set(lx, y, lz, type);
+        chunk.SetFluidLevel(lx, y, lz, fluidLevel);
         chunk.NeedsSave = true;
         HasBeenModified = true;
         MarkMeshDirty(chunk, lx, lz);
         Lighting.OnBlockChanged(x, y, z, type);
+        Fluids.OnBlockChanged(x, y, z);
     }
 
     /// <summary>Solid for collision purposes. Unloaded chunks count as solid so nothing falls into the void.</summary>
@@ -119,6 +150,9 @@ public sealed class World
         if (_chunks.TryGetValue(new Point(chunkX, chunkZ), out var c)) c.NeedsMesh = true;
     }
 
+    /// <summary>Advances time-based simulation (water flow). Call once per frame.</summary>
+    public void Tick(float dt) => Fluids.Update(dt);
+
     // ---- Streaming ----
 
     /// <summary>
@@ -139,7 +173,9 @@ public sealed class World
 
             var chunk = new Chunk(key.X, key.Y);
             // A chunk the player edited comes from disk; anything else is generated from the seed.
-            if (_storage == null || !_storage.TryLoadChunk(chunk))
+            if (_storage != null && _storage.TryLoadChunk(chunk))
+                Generator.FillRiverFlow(chunk);   // rivers are not saved, only the blocks
+            else
                 Generator.Generate(chunk);
             _chunks[key] = chunk;
             Lighting.InitializeChunk(chunk);

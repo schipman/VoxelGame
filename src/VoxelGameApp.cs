@@ -129,16 +129,24 @@ public sealed class VoxelGameApp : Game
         if (_mouseCaptured && IsActive)
             _camera.Rotate(-_input.MouseDelta.X * MouseSensitivity, -_input.MouseDelta.Y * MouseSensitivity);
 
-        if (_input.WasPressed(Keys.F5)) _renderer.ReloadAtlas();   // edit blocks.png, tab back, press F5
+        if (_input.WasPressed(Keys.F5)) _renderer.ReloadTextures();   // edit blocks.png, tab back, press F5
 
         _sky.Update(dt, _input.IsKeyDown(Keys.T) ? 60f : 1f);   // hold T to fast-forward time
 
+        var previousXZ = new Vector2(_player.Position.X, _player.Position.Z);
         _player.Update(dt, _input, _camera.Yaw, _world);
         _camera.Position = _player.EyePosition;
+        StirWater(previousXZ, dt);
+        if (_options.Rain) SprinkleRain(dt);
+
+        // Is the camera under water? (Looking up at the surface from below, the water shader takes over.)
+        var eye = _camera.Position;
+        _renderer.CameraUnderwater = _world.WaterSurface((int)MathF.Floor(eye.X), (int)MathF.Floor(eye.Y), (int)MathF.Floor(eye.Z)) is { } surface && surface > eye.Y;
 
         _interaction.Update(dt, _input, _camera, _world, _player, canInteract && _mouseCaptured);
 
         _world.Update(_player.Position, maxGenerate: 2, maxMesh: 2);
+        _world.Tick(dt);   // water flow
 
         _autosaveTimer += gameTime.ElapsedGameTime.TotalSeconds;
         if (_autosaveTimer >= AutosaveSeconds)
@@ -153,13 +161,17 @@ public sealed class VoxelGameApp : Game
 
     protected override void Draw(GameTime gameTime)
     {
+        float dt = (float)gameTime.ElapsedGameTime.TotalSeconds;
         _camera.AspectRatio = GraphicsDevice.Viewport.AspectRatio;
-        _renderer.RenderShadows(_world, _camera, _sky);   // must come first: it switches render targets
 
-        GraphicsDevice.Clear(new Color(_sky.SkyColor));
-        _celestials.Draw(_camera, _sky);
-        _renderer.Draw(_world, _camera, _sky);
+        // The world is drawn off screen and copied to the window at the end; see WorldRenderer.
+        _renderer.Prepare(_world, _camera, _sky, dt);   // ripples and shadows: these switch render targets, so they go first
+        _renderer.BeginScene(_sky);
+        if (!_renderer.CameraUnderwater) _celestials.Draw(_camera, _sky);
+        _renderer.DrawTerrain(_world, _camera, _sky);
+        _renderer.DrawWater(_world, _camera, _sky, _player.Position);
         if (_interaction.Target is { } target) _outline.Draw(target, _camera);
+        _renderer.Present();
 
         DrawCrosshair();
         base.Draw(gameTime);
@@ -173,6 +185,59 @@ public sealed class VoxelGameApp : Game
         _spriteBatch.Draw(_pixel, new Rectangle(cx - 8, cy - 1, 16, 2), Color.White * 0.8f);
         _spriteBatch.Draw(_pixel, new Rectangle(cx - 1, cy - 8, 2, 16), Color.White * 0.8f);
         _spriteBatch.End();
+    }
+
+    private readonly Random _rain = new(11);
+    private float _rainTimer;
+
+    /// <summary>Test aid: random raindrop ripples around the player.</summary>
+    private void SprinkleRain(float dt)
+    {
+        _rainTimer += dt;
+        while (_rainTimer > 0.05f)
+        {
+            _rainTimer -= 0.05f;
+            var drop = new Vector2(_player.Position.X + (float)(_rain.NextDouble() * 28 - 14), _player.Position.Z + (float)(_rain.NextDouble() * 28 - 14));
+            _renderer.Ripples.Disturb(drop, drop, 0.5f, 0.35f);
+        }
+    }
+
+    private float _treadTimer;
+
+    /// <summary>
+    /// Leaves ripples where the player disturbs water: a splash on diving in, a wake while moving through it (swimming
+    /// or just wading), and slow rings while treading water at the surface. Deep swimming barely stirs the surface.
+    /// </summary>
+    private void StirWater(Vector2 previousXZ, float dt)
+    {
+        var now = new Vector2(_player.Position.X, _player.Position.Z);
+
+        if (_player.JustEnteredWater)
+            _renderer.Ripples.Disturb(now, now, 1.4f, Math.Min(0.08f * _player.EntrySpeed, 0.7f));
+
+        // Feet touching water is enough: walking through shallows makes ripples too.
+        bool touching = _player.WaterSurfaceY > _player.Position.Y + 0.02f;
+        if (!touching || dt <= 0f) return;
+
+        float chestDepth = Math.Max(_player.WaterSurfaceY - (_player.Position.Y + 1.0f), 0f);   // how far the surface is above the chest
+        float nearSurface = MathF.Exp(-chestDepth * 0.9f);
+        float speed = (now - previousXZ).Length() / dt;
+
+        // The wake is pushed a little ahead of the swimmer, so the bow ripples are in front of the camera, not under it.
+        float wake = Math.Min(speed * 0.045f, 0.16f) * nearSurface;
+        if (wake > 0.02f)
+        {
+            var ahead = (now - previousXZ) / Math.Max((now - previousXZ).Length(), 1e-4f) * 1.4f;
+            _renderer.Ripples.Disturb(previousXZ + ahead, now + ahead, 1.0f, wake);
+        }
+
+        // Treading water: the body bobbing leaves a slow ring every so often.
+        _treadTimer += dt;
+        if (_player.IsInWater && chestDepth < 0.4f && _treadTimer > 0.7f)
+        {
+            _treadTimer = 0f;
+            _renderer.Ripples.Disturb(now, now, 1.2f, 0.10f);
+        }
     }
 
     /// <summary>Writes changed chunks and the level file. A brand-new world nobody has touched is not saved.</summary>
@@ -201,6 +266,8 @@ public sealed class VoxelGameApp : Game
         base.OnExiting(sender, args);
     }
 
+    private bool Solid(int x, int y, int z) => BlockRegistry.Get(_world.GetBlock(x, y, z)).IsSolid;
+
     /// <summary>A new player might be placed inside a tree; nudge them to the nearest column with open air above the ground.</summary>
     private void MoveToClearSpot()
     {
@@ -211,8 +278,7 @@ public sealed class VoxelGameApp : Game
             {
                 if (Math.Max(Math.Abs(dx), Math.Abs(dz)) != r) continue;
                 int x = bx + dx, z = bz + dz, ground = _world.Generator.GetHeight(x, z);
-                if (_world.GetBlock(x, ground + 1, z) == BlockType.Air && _world.GetBlock(x, ground + 2, z) == BlockType.Air &&
-                    _world.GetBlock(x, ground + 3, z) == BlockType.Air)
+                if (!Solid(x, ground + 1, z) && !Solid(x, ground + 2, z) && !Solid(x, ground + 3, z))
                 {
                     _player.Position = new Vector3(x + 0.5f, ground + 1.1f, z + 0.5f);
                     return;
@@ -225,6 +291,13 @@ public sealed class VoxelGameApp : Game
         if (_options.Time is { } time) _sky.Time = time;
         if (_options.Yaw is { } yaw) _camera.Rotate(MathHelper.ToRadians(yaw), 0);
         if (_options.Pitch is { } pitch) _camera.Rotate(0, MathHelper.ToRadians(pitch));
+        if (_options.Lift is { } lift) _player.Position += new Vector3(0, lift, 0);
+        if (_options.Fly) _player.IsFlying = true;
+        if (_options.Spill)
+        {
+            int sx = (int)MathF.Floor(_player.Position.X), sz = (int)MathF.Floor(_player.Position.Z) - 6;
+            _world.SetBlock(sx, _world.Generator.GetHeight(sx, sz) + 5, sz, BlockType.Water);
+        }
         if (_options.Lamp)
         {
             int lx = (int)MathF.Floor(_player.Position.X), lz = (int)MathF.Floor(_player.Position.Z) - 3;
@@ -245,7 +318,7 @@ public sealed class VoxelGameApp : Game
                        $"chunks {_renderer.ChunksDrawn}/{_world.Chunks.Count} | " +
                        $"{BiomeRegistry.Get(_world.Generator.GetBiome((int)MathF.Floor(p.X), (int)MathF.Floor(p.Z))).Name} | " +
                        $"holding {BlockRegistry.Get(_interaction.SelectedBlock).Name}" +
-                       (_player.IsFlying ? " | FLYING" : "");
+                       (_player.IsFlying ? " | FLYING" : "") + (_player.IsSubmerged ? " | UNDERWATER" : _player.IsInWater ? " | SWIMMING" : "");
     }
 
     protected override void UnloadContent()

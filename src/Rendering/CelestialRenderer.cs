@@ -7,6 +7,16 @@ namespace VoxelGame.Rendering;
 /// <summary>Draws the sun, moon and stars as flat sprites behind the world. Call before the terrain is drawn.</summary>
 public sealed class CelestialRenderer
 {
+    // Premultiplied alpha blending that leaves the destination's alpha channel alone: the scene stores distance there.
+    private static readonly BlendState SceneBlend = new()
+    {
+        ColorSourceBlend = Blend.One,
+        ColorDestinationBlend = Blend.InverseSourceAlpha,
+        AlphaSourceBlend = Blend.Zero,
+        AlphaDestinationBlend = Blend.One,
+        ColorWriteChannels = ColorWriteChannels.Red | ColorWriteChannels.Green | ColorWriteChannels.Blue,
+    };
+
     private readonly SpriteBatch _batch;
     private readonly Texture2D _pixel;
     private readonly Vector3[] _stars;
@@ -33,7 +43,7 @@ public sealed class CelestialRenderer
         var viewProjection = camera.View * camera.Projection;
         var viewport = _batch.GraphicsDevice.Viewport;
 
-        _batch.Begin(blendState: BlendState.AlphaBlend, samplerState: SamplerState.PointClamp);
+        _batch.Begin(blendState: SceneBlend, samplerState: SamplerState.PointClamp);
 
         float night = 1f - sky.Daylight;
         if (night > 0.05f)

@@ -68,7 +68,7 @@ public sealed class BlockInteraction
     {
         var (x, y, z) = hit.PlacePosition;
         if (hit.NormalX == 0 && hit.NormalY == 0 && hit.NormalZ == 0) return;   // camera is inside the block
-        if (world.GetBlock(x, y, z) != BlockType.Air) return;
+        if (BlockRegistry.Get(world.GetBlock(x, y, z)).IsSolid) return;   // air and water can be built into
         if (player.OverlapsBlock(x, y, z)) return;                              // don't entomb the player
         world.SetBlock(x, y, z, SelectedBlock);
     }
