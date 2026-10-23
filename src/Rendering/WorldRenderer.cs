@@ -33,8 +33,16 @@ public sealed class WorldRenderer : IDisposable
     private RenderTarget2D _scene;
     private RenderTarget2D _refraction;
 
-    private Matrix _lightViewProjection;
+    private Matrix _lightViewProjection = Matrix.Identity;
     private float _time;
+
+    // The shadow map is only redrawn when it could look different (see Prepare), so these remember what it was drawn from.
+    private bool _shadowValid;
+    private Vector3 _shadowCentre, _shadowDirection;
+    private int _shadowRevision;
+
+    /// <summary>How many times the shadow map was redrawn (for profiling).</summary>
+    public int ShadowRedraws { get; private set; }
 
     public RippleSimulator Ripples { get; }
 
@@ -45,6 +53,10 @@ public sealed class WorldRenderer : IDisposable
     public bool ShadowsEnabled { get; set; } = true;
     private bool _shadowMapCleared;
     public int ChunksDrawn { get; private set; }
+
+    /// <summary>For profiling: what the last frame sent to the GPU, over every pass (shadows, terrain, water).</summary>
+    public int TrianglesDrawn { get; private set; }
+    public int DrawCalls { get; private set; }
 
     /// <summary>True when the camera is under water: everything gets the murky underwater fog.</summary>
     public bool CameraUnderwater { get; set; }
@@ -68,19 +80,34 @@ public sealed class WorldRenderer : IDisposable
     /// <summary>Stage 1. Call before BeginScene: both switch render targets, which wipes the back buffer.</summary>
     public void Prepare(World world, Camera camera, DayNightCycle sky, float dt)
     {
+        TrianglesDrawn = 0;
+        DrawCalls = 0;
         _time = (_time + dt) % 3600f;   // wrapped so the shaders' sines keep their precision on long sessions
         Ripples.Update(dt);
-
-        _lightViewProjection = BuildLightMatrix(camera, sky);
 
         // At dusk and dawn the light is ~0, so skip the shadow pass entirely.
         if (ShadowsEnabled && sky.LightColor.LengthSquared() > 1e-4f)
         {
-            DrawShadowMap(world);
+            // Redrawing the shadow map means drawing the whole nearby world a second time, so only do it when the result
+            // could differ: the sun has moved noticeably, the shadow camera has been re-centred (it follows the player in
+            // 4-block steps rather than continuously), or some chunk's mesh changed. Standing still, that is a few times a second.
+            var centre = SnapToGrid(camera.Position, ShadowCentreStep);
+            bool sunMoved = Vector3.Dot(sky.LightDirection, _shadowDirection) < 0.999998f;
+            if (!_shadowValid || centre != _shadowCentre || sunMoved || world.MeshRevision != _shadowRevision)
+            {
+                _lightViewProjection = BuildLightMatrix(centre, sky);
+                DrawShadowMap(world);
+                _shadowValid = true;
+                _shadowCentre = centre;
+                _shadowDirection = sky.LightDirection;
+                _shadowRevision = world.MeshRevision;
+                ShadowRedraws++;
+            }
             _shadowMapCleared = false;
         }
         else if (!ShadowsEnabled && !_shadowMapCleared)
         {
+            _shadowValid = false;
             // An all-white map means "nothing blocks the sun anywhere".
             _device.SetRenderTarget(_shadowMap);
             _device.Clear(Color.White);
@@ -117,6 +144,7 @@ public sealed class WorldRenderer : IDisposable
         Set(effect, "FogStart", fog.Start);
         Set(effect, "FogEnd", fog.End);
         Set(effect, "Time", _time);
+        Set(effect, "TileSize", 1f / TextureAtlas.TilesPerRow);
         Set(effect, "ShadowMapSize", (float)ShadowMapSize);
         Set(effect, "ShadowBias", ShadowTexel * 1.5f / (LightDistance * 2f));
         Set(effect, "ShadowNormalOffset", ShadowTexel * 1.5f);
@@ -132,7 +160,7 @@ public sealed class WorldRenderer : IDisposable
         _device.SamplerStates[1] = SamplerState.PointClamp;
 
         ChunksDrawn = 0;
-        DrawMeshes(world, new BoundingFrustum(camera.View * camera.Projection), water: false, countDrawn: true);
+        DrawMeshes(world, new BoundingFrustum(camera.View * camera.Projection), water: false, countDrawn: true, sortFrom: camera.Position);
     }
 
     /// <summary>Stage 4. Water is skipped entirely if none is in view.</summary>
@@ -196,6 +224,11 @@ public sealed class WorldRenderer : IDisposable
 
     // ---------------------------------------------------------------- pieces
 
+    private const float ShadowCentreStep = 4f;   // blocks the shadow camera moves in
+
+    private static Vector3 SnapToGrid(Vector3 p, float step) =>
+        new(MathF.Floor(p.X / step) * step, MathF.Floor(p.Y / step) * step, MathF.Floor(p.Z / step) * step);
+
     private static readonly Vector3 BlockLightColor = new(1.3f, 1.0f, 0.62f);
 
     private static float ShadowTexel => ShadowRange / ShadowMapSize;
@@ -217,18 +250,33 @@ public sealed class WorldRenderer : IDisposable
         _device.SetRenderTarget(null);
     }
 
-    private void DrawMeshes(World world, BoundingFrustum frustum, bool water, bool countDrawn)
+    private readonly List<(float Distance, Chunk Chunk)> _visible = new();
+
+    /// <param name="sortFrom">If given, nearer chunks are drawn first. Opaque geometry drawn near-to-far lets the GPU skip shading pixels that a nearer chunk will cover.</param>
+    private void DrawMeshes(World world, BoundingFrustum frustum, bool water, bool countDrawn, Vector3? sortFrom = null)
     {
         var effect = water ? _water : _terrain;
         effect.CurrentTechnique.Passes[0].Apply();
+
+        _visible.Clear();
         foreach (var chunk in world.Chunks)
         {
             var mesh = water ? chunk.WaterMesh : chunk.Mesh;
             if (mesh.IndexCount == 0 || !frustum.Intersects(chunk.Bounds)) continue;
+            float distance = sortFrom is { } from ? Vector2.DistanceSquared(new Vector2(chunk.WorldX + 8, chunk.WorldZ + 8), new Vector2(from.X, from.Z)) : 0f;
+            _visible.Add((distance, chunk));
+        }
+        if (sortFrom != null) _visible.Sort((a, b) => a.Distance.CompareTo(b.Distance));
+
+        foreach (var (_, chunk) in _visible)
+        {
+            var mesh = water ? chunk.WaterMesh : chunk.Mesh;
 
             _device.SetVertexBuffer(mesh.VertexBuffer);
             _device.Indices = mesh.IndexBuffer;
             _device.DrawIndexedPrimitives(PrimitiveType.TriangleList, 0, 0, mesh.IndexCount / 3);
+            TrianglesDrawn += mesh.IndexCount / 3;
+            DrawCalls++;
             if (countDrawn) ChunksDrawn++;
         }
     }
@@ -284,14 +332,14 @@ public sealed class WorldRenderer : IDisposable
     /// Orthographic camera looking along the light direction, centred on the player. Its position is snapped
     /// to whole shadow-map texels so shadow edges don't shimmer as the player moves.
     /// </summary>
-    private static Matrix BuildLightMatrix(Camera camera, DayNightCycle sky)
+    private static Matrix BuildLightMatrix(Vector3 centreOfInterest, DayNightCycle sky)
     {
         var dir = sky.LightDirection;
         var up = MathF.Abs(dir.Y) > 0.99f ? Vector3.Right : Vector3.Up;
-        var view = Matrix.CreateLookAt(camera.Position + dir * LightDistance, camera.Position, up);
+        var view = Matrix.CreateLookAt(centreOfInterest + dir * LightDistance, centreOfInterest, up);
 
         float texel = ShadowTexel;
-        var centre = Vector3.Transform(camera.Position, view);
+        var centre = Vector3.Transform(centreOfInterest, view);
         view *= Matrix.CreateTranslation(
             MathF.Round(centre.X / texel) * texel - centre.X,
             MathF.Round(centre.Y / texel) * texel - centre.Y,

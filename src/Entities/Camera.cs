@@ -22,6 +22,14 @@ public sealed class Camera
     public Matrix View => Matrix.CreateLookAt(Position, Position + Forward, Vector3.Up);
     public Matrix Projection => Matrix.CreatePerspectiveFieldOfView(FieldOfView, AspectRatio, NearPlane, FarPlane);
 
+    /// <summary>Points the camera at exact angles (radians).</summary>
+    public void SetRotation(float yaw, float pitch)
+    {
+        Yaw = yaw;
+        Pitch = 0;
+        Rotate(0, pitch);
+    }
+
     /// <summary>Turns the camera by the given angles (radians).</summary>
     public void Rotate(float deltaYaw, float deltaPitch)
     {

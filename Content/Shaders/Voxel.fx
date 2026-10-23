@@ -7,6 +7,9 @@
 // Per-vertex data (all 0..1):
 //   COLOR0: R = sky light level   G = block light level   B = ambient occlusion   A = emissive (lamp faces)
 //   COLOR1: R = depth under water (blocks / 15; 0 = not underwater)   G = sky light at the water's surface
+//           B = texture tile column   A = texture tile row  (bytes 0..255, i.e. the index / 255)
+//   TEXCOORD0: position inside the tile, counted in tiles. A merged quad covering w x h blocks runs 0..w and 0..h,
+//              and the shader wraps it so the one tile repeats.
 
 #if OPENGL
     #define SV_POSITION POSITION
@@ -29,6 +32,7 @@ float3 FogColor;
 float FogStart;
 float FogEnd;
 float Time;                 // seconds, for animating caustics
+float TileSize;             // size of one tile in the block atlas, in UV units (1 / tiles per row)
 
 float ShadowMapSize;
 float ShadowBias;           // in normalised depth units
@@ -146,7 +150,12 @@ float Caustics(float3 worldPos, float3 normal)
 
 float4 MainPS(VSOutput input) : COLOR0
 {
-    float4 tex = tex2D(BlockSampler, input.TexCoord);
+    // Find the texel: wrap the tile-space coordinate into 0..1 (keeping exact multiples at 1, so a quad's far edge still
+    // samples the tile's last column), pull it a hair inside to avoid bleeding from neighbouring tiles, then offset to the tile.
+    float2 tileOrigin = round(input.Extra.ba * 255.0) * TileSize;
+    float2 inTile = input.TexCoord - floor(input.TexCoord - 0.0001);
+    inTile = clamp(inTile, 0.001, 0.999);
+    float4 tex = tex2D(BlockSampler, tileOrigin + inTile * TileSize);
 
     float sky = input.Light.r;
     float blk = input.Light.g;

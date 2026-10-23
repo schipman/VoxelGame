@@ -14,6 +14,9 @@ namespace VoxelGame;
 ///   --spill       place a water source in mid-air in front of the player, to watch it pour and spread
 ///   --screen=NAME open a menu at start: inventory, pause or settings
 ///   --survival    start in survival mode (blocks are collected and used up)
+///   --bench       run the performance benchmark (uncapped frame rate, three viewpoints), print the results and exit
+///   --distance=N  render distance in chunks (overrides the setting; used with --bench)
+///   --size=WxH    window size in pixels, e.g. --size=2560x1440 (used with --bench to measure pixel cost)
 ///   --lamp        place a lamp on the ground in front of the spawn point
 /// </summary>
 public sealed class LaunchOptions
@@ -30,6 +33,9 @@ public sealed class LaunchOptions
     public bool Spill { get; private set; }
     public string Screen { get; private set; }
     public bool Survival { get; private set; }
+    public bool Bench { get; private set; }
+    public int? Distance { get; private set; }
+    public (int W, int H)? Size { get; private set; }
     public bool Lamp { get; private set; }
 
     public static LaunchOptions Parse(string[] args)
@@ -62,6 +68,12 @@ public sealed class LaunchOptions
                 case "spill": options.Spill = true; break;
                 case "screen" when hasValue: options.Screen = parts[1].ToLowerInvariant(); break;
                 case "survival": options.Survival = true; break;
+                case "bench": options.Bench = true; break;
+                case "distance" when hasValue && int.TryParse(parts[1], out int dist): options.Distance = dist; break;
+                case "size" when hasValue:
+                    var wh = parts[1].Split('x');
+                    if (wh.Length == 2 && int.TryParse(wh[0], out int sw) && int.TryParse(wh[1], out int sh)) options.Size = (sw, sh);
+                    break;
                 case "lamp": options.Lamp = true; break;
             }
         }

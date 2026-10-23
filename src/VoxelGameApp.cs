@@ -2,6 +2,7 @@ using Microsoft.Xna.Framework;
 using Microsoft.Xna.Framework.Graphics;
 using Microsoft.Xna.Framework.Input;
 using VoxelGame.Blocks;
+using VoxelGame.Diagnostics;
 using VoxelGame.Entities;
 using VoxelGame.Input;
 using VoxelGame.Items;
@@ -49,6 +50,10 @@ public sealed class VoxelGameApp : Game
     private bool _mouseGate = true;     // swallows the click that closed a menu, so it doesn't also break a block
     private bool _iconsDirty = true;
     private (int Slot, BlockType Block) _lastHeld;
+    private Benchmark _bench;
+    private readonly System.Diagnostics.Stopwatch _frameClock = System.Diagnostics.Stopwatch.StartNew();
+    private double _updateMs, _drawMs;
+    private double _lastFrameSeconds = 1 / 60.0;
 
     public VoxelGameApp(LaunchOptions options)
     {
@@ -64,27 +69,52 @@ public sealed class VoxelGameApp : Game
         IsMouseVisible = false;
     }
 
+    /// <summary>Start-up phase timings, shown by --bench so slow spots are easy to find.</summary>
+    private readonly System.Diagnostics.Stopwatch _startupClock = System.Diagnostics.Stopwatch.StartNew();
+    private readonly List<string> _startupPhases = new();
+    private void Phase(string name) { _startupPhases.Add($"{name} {_startupClock.ElapsedMilliseconds} ms"); _startupClock.Restart(); }
+
     protected override void LoadContent()
     {
+        Phase("before LoadContent (process start to here)");
         _spriteBatch = new SpriteBatch(GraphicsDevice);
         _pixel = new Texture2D(GraphicsDevice, 1, 1);
         _pixel.SetData(new[] { Color.White });
 
-        _settings = GameSettings.Load(GameSettings.DefaultPath);
+        _settings = _options.Bench ? new GameSettings() : GameSettings.Load(GameSettings.DefaultPath);
         _settings.Clamp();
+        if (_options.Distance is { } distance) _settings.RenderDistance = distance;
+        if (_options.Size is { } size)
+        {
+            _graphics.PreferredBackBufferWidth = size.W;
+            _graphics.PreferredBackBufferHeight = size.H;
+            _graphics.ApplyChanges();
+        }
+        if (_options.Bench)
+        {
+            // Fixed conditions, no frame-rate cap, so runs are comparable.
+            _bench = new Benchmark();
+            _settings.ShowDebugText = false;
+            IsFixedTimeStep = false;
+            _graphics.SynchronizeWithVerticalRetrace = false;
+            _graphics.ApplyChanges();
+        }
         if (_options.Survival) _settings.GameMode = GameMode.Survival;
 
         _renderer = new WorldRenderer(GraphicsDevice, Content);
         _celestials = new CelestialRenderer(_spriteBatch, _pixel);
         _outline = new BlockOutlineRenderer(GraphicsDevice);
         _interaction = new BlockInteraction(_inventory);
+        Phase("renderer, shaders, textures");
 
         // A new random world every launch, unless a seed is given. Worlds are saved by seed, so
         // launching with --seed=N again brings back that world with everything built or dug in it.
-        int seed = _options.Seed ?? Random.Shared.Next();
+        int seed = _options.Bench ? Benchmark.Seed : _options.Seed ?? Random.Shared.Next();
         _storage = new WorldStorage(WorldStorage.DefaultRoot, seed);
         var level = _storage.LoadLevel();
-        _world = new World(GraphicsDevice, seed, _settings.RenderDistance, _storage);
+        // Chunks are generated and meshed on background threads; keep a couple of cores free for the game itself.
+        int workers = Math.Clamp(Environment.ProcessorCount - 2, 1, 6);
+        _world = new World(GraphicsDevice, seed, _settings.RenderDistance, _storage, workers);
         Console.WriteLine($"World seed {seed}: {(level != null ? "loaded from" : "new, saves to")} {_storage.Directory}");
 
         if (level != null && level.GeneratorVersion != WorldGenerator.Version)
@@ -104,6 +134,7 @@ public sealed class VoxelGameApp : Game
             _player = new Player(new Vector3(sx + 0.5f, _world.Generator.GetHeight(sx, sz) + 2, sz + 0.5f));
         }
         LoadInventory(level);
+        Phase("world setup, spawn search");
 
         if (_options.Teleport is { } tp)
             _player.Position = new Vector3(tp.X + 0.5f, _world.Generator.GetHeight(tp.X, tp.Z) + 2, tp.Z + 0.5f);
@@ -117,12 +148,14 @@ public sealed class VoxelGameApp : Game
         }
 
         // Load everything around the player before the first frame.
-        _world.Update(_player.Position, int.MaxValue, int.MaxValue);
+        _world.LoadAll(_player.Position);
         if (level == null) MoveToClearSpot();
+        Phase($"load {_world.Chunks.Count} chunks");
 
         BuildUi();
         ApplyFullscreen();   // start fullscreen if that was left on
         ApplyLaunchOptions();
+        Phase("UI, icons, launch options");
     }
 
     // ---- UI ----
@@ -171,6 +204,13 @@ public sealed class VoxelGameApp : Game
 
     protected override void Update(GameTime gameTime)
     {
+        double updateStart = _frameClock.Elapsed.TotalMilliseconds;
+        UpdateCore(gameTime);
+        _updateMs = _frameClock.Elapsed.TotalMilliseconds - updateStart;
+    }
+
+    private void UpdateCore(GameTime gameTime)
+    {
         float dt = Math.Min((float)gameTime.ElapsedGameTime.TotalSeconds, 0.05f);
 
         // While a menu is open the mouse is a normal cursor; otherwise it is grabbed for looking around.
@@ -179,7 +219,7 @@ public sealed class VoxelGameApp : Game
         _input.Update(mouseGrabbed, center);
 
         // Switching to another window pauses the game, like most games do.
-        if (_wasActive && !IsActive && !_ui.HasScreen) OpenPause();
+        if (_wasActive && !IsActive && !_ui.HasScreen && _bench == null) OpenPause();
         _wasActive |= IsActive;
 
         if (_input.WasPressed(Keys.Escape))
@@ -216,7 +256,7 @@ public sealed class VoxelGameApp : Game
 
         if (simulating)
         {
-            _sky.Update(dt, playing && _input.IsKeyDown(Keys.T) ? 60f : 1f);   // hold T to fast-forward time
+            if (_bench == null) _sky.Update(dt, playing && _input.IsKeyDown(Keys.T) ? 60f : 1f);   // hold T to fast-forward time
 
             var previousXZ = new Vector2(_player.Position.X, _player.Position.Z);
             _player.Update(dt, gameInput, _camera.Yaw, _world);
@@ -226,7 +266,7 @@ public sealed class VoxelGameApp : Game
             _interaction.Update(dt, gameInput, _camera, _world, _player, _settings.GameMode, playing && !_mouseGate);
             _world.Tick(dt);   // water flow
         }
-        _world.Update(_player.Position, maxGenerate: 4, maxMesh: 4, timeBudgetMs: 6);
+        _world.Update(_player.Position, maxGenerate: 8, maxMesh: 8, timeBudgetMs: 4);
 
         _camera.Position = _player.EyePosition;
 
@@ -275,6 +315,48 @@ public sealed class VoxelGameApp : Game
     private int _fpsFrames;
 
     protected override void Draw(GameTime gameTime)
+    {
+        double drawStart = _frameClock.Elapsed.TotalMilliseconds;
+        _lastFrameSeconds = gameTime.ElapsedGameTime.TotalSeconds;
+        DrawCore(gameTime);
+        _drawMs = _frameClock.Elapsed.TotalMilliseconds - drawStart;
+        if (_bench != null) RunBenchmark();
+    }
+
+    private bool _startupReported;
+
+    private void RunBenchmark()
+    {
+        if (!_startupReported)
+        {
+            _startupReported = true;
+            double ms = (DateTime.Now - System.Diagnostics.Process.GetCurrentProcess().StartTime).TotalMilliseconds;
+            _bench.StartupLine = $"start-up: {ms / 1000:F2} s from launch to the first frame (render distance {_world.RenderDistance}, {_world.Chunks.Count} chunks loaded)\n    "
+                                 + string.Join("\n    ", _startupPhases);
+        }
+        if (_bench.CurrentSpeed > 0)
+        {
+            float yaw = _bench.CurrentYaw;
+            _player.Position += new Vector3(-MathF.Sin(yaw), 0, -MathF.Cos(yaw)) * _bench.CurrentSpeed * (float)_lastFrameSeconds;
+        }
+        if (_bench.TakeTeleport() is { } first) BenchTeleport(first);
+        if (_bench.EndFrame(_updateMs, _drawMs, _renderer.TrianglesDrawn, _renderer.DrawCalls, _world.CountPendingWork(_player.Position)) is { } next)
+            BenchTeleport(next);
+        if (_bench.Finished) Exit();
+    }
+
+    /// <summary>Moves the flying camera to the nearest spot of a biome, a given height above the ground, looking a given way.</summary>
+    private void BenchTeleport((Biome Biome, float Lift, float Yaw, float Pitch) scene)
+    {
+        var from = _player.Position;
+        var at = _world.Generator.FindBiome(scene.Biome, (int)from.X, (int)from.Z) ?? ((int)from.X, (int)from.Z);
+        _player.IsFlying = true;
+        _player.Position = new Vector3(at.Item1 + 0.5f, _world.Generator.GetHeight(at.Item1, at.Item2) + 2 + scene.Lift, at.Item2 + 0.5f);
+        _camera.SetRotation(scene.Yaw, scene.Pitch);
+        _sky.Time = 0.4f;
+    }
+
+    private void DrawCore(GameTime gameTime)
     {
         float dt = (float)gameTime.ElapsedGameTime.TotalSeconds;
         _camera.AspectRatio = GraphicsDevice.Viewport.AspectRatio;
@@ -384,7 +466,7 @@ public sealed class VoxelGameApp : Game
         if (wake > 0.01f)
         {
             var ahead = (now - previousXZ) / Math.Max((now - previousXZ).Length(), 1e-4f) * 1.0f;
-            _renderer.Ripples.Disturb(previousXZ + ahead, now + ahead, 0.55f, wake);
+            _renderer.Ripples.Disturb(previousXZ + ahead, now + ahead, 0.7f, wake);
         }
 
         // Treading water: the body bobbing leaves a slow ring every so often.
@@ -392,7 +474,7 @@ public sealed class VoxelGameApp : Game
         if (_player.IsInWater && chestDepth < 0.4f && _treadTimer > 0.7f)
         {
             _treadTimer = 0f;
-            _renderer.Ripples.Disturb(now, now, 0.8f, 0.045f);
+            _renderer.Ripples.Disturb(now, now, 0.8f, 0.07f);
         }
     }
 
@@ -496,6 +578,7 @@ public sealed class VoxelGameApp : Game
 
     protected override void UnloadContent()
     {
+        _world.Dispose();
         foreach (var chunk in _world.Chunks) chunk.Dispose();
         _renderer.Dispose();
         _outline.Dispose();

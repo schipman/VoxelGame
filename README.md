@@ -40,6 +40,31 @@ To visit a biome: `dotnet run -- --find=PaleGarden` or `--find=River` (any name 
 or `--tp=X,Z`.
 The window title shows the biome you are standing in.
 
+## Performance
+
+How the game stays fast, and how to measure it.
+
+- **Benchmark:** `dotnet run -c Release -- --bench` lifts the frame-rate cap, visits four fixed viewpoints and a flight over
+  unexplored land in a fixed world, and prints frame times, triangles, draw calls and start-up phases. `--distance=N` sets the
+  render distance and `--size=2560x1440` the window size. Compare runs on the same machine.
+- **Build configuration:** `dotnet run` builds Debug by default, which used to be several times slower. Debug is now optimised
+  (see `VoxelGame.csproj`); `-c Release` is still the fastest.
+- **Greedy meshing** (`ChunkMesher`): neighbouring faces with the same texture and identical lighting are merged into one big
+  rectangle, roughly halving the triangles. Following the 0fps ambient-occlusion article, only faces whose four corners are lit
+  identically are merged, so a merged quad looks exactly like the faces it replaces; faces on a lighting gradient stay single.
+  The vertex's texture coordinate counts tiles and the shader wraps it inside the tile named in the vertex's extra data.
+- **Worker threads** (`ChunkWorkers`): terrain generation and meshing run on background threads (your core count minus 2, at most 6).
+  The main thread only lights new chunks (that edits neighbouring chunks, so it can't run beside other work), uploads finished
+  meshes to the GPU, and meshes chunks you just edited so changes appear on the next frame. A chunk's `Version` number guards
+  against races: a mesh built from an old snapshot never marks an edited chunk as up to date. Tests build worlds with 0 workers,
+  which does everything on one thread and gives identical results.
+- **Smaller wins:** meshing and lighting skip the empty air above the terrain (`Chunk.TopY`); chunk meshes use 16-bit indices when
+  they can; the shadow map is only redrawn when the sun has moved noticeably, the shadow camera has re-centred (it follows the
+  player in 4-block steps) or a mesh changed; terrain is drawn nearest chunk first so the GPU can skip hidden pixels; chunk loading
+  has a time budget per frame so the game never stalls.
+- **What to expect:** on a fast GPU the frame rate was already limited by the monitor. The gains show up as faster start-up and
+  loading, no hitches while exploring, half the triangles (which is what matters on slower GPUs and at long view distances).
+
 ## User interface
 
 A small widget toolkit in `src/UI/`, plus the screens built from it. Everything is laid out in "UI pixels" and scaled up
@@ -212,6 +237,8 @@ src/
   Terrain/
     Chunk.cs             16x128x16 block array + its GPU mesh
     World.cs             loaded chunks, Get/SetBlock in world coords, chunk streaming
+    ChunkNeighborhood.cs  a chunk plus its 8 neighbours as a snapshot the mesher reads (thread-safe)
+    ChunkWorkers.cs      background threads that generate and mesh chunks
     LightingEngine.cs    voxel light: sky + block light flood fill, incremental add/remove
     FluidSimulator.cs    water flow: sources, falling, spreading, drying up
     RiverNetwork.cs      rivers traced downhill from highlands to the sea
@@ -229,7 +256,7 @@ src/
     AssetFiles.cs        loads editable PNGs from disk
     RippleSimulator.cs   GPU ripple wave simulation
     FullscreenQuad.cs    draws a shader over a whole render target
-    ChunkMesher.cs       blocks -> triangles; bakes smooth light + ambient occlusion per vertex
+    ChunkMesher.cs       blocks -> greedy-merged triangles; bakes smooth light + ambient occlusion per vertex
     VoxelVertex.cs       vertex format (position, normal, uv, light)
     WorldRenderer.cs     frame pipeline: shadows, scene, water (Voxel.fx, Water.fx), present
     DayNightCycle.cs     time of day -> sun direction, light/sky/ambient colours

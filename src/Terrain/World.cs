@@ -10,7 +10,7 @@ namespace VoxelGame.Terrain;
 /// The set of loaded chunks. Everything outside this class talks in world block coordinates;
 /// the chunk lookup is handled here.
 /// </summary>
-public sealed class World
+public sealed class World : IDisposable
 {
     private readonly Dictionary<Point, Chunk> _chunks = new();
     private readonly GraphicsDevice _device;
@@ -28,7 +28,20 @@ public sealed class World
     /// <summary>True once any block has been changed in this session; used to avoid saving untouched worlds.</summary>
     public bool HasBeenModified { get; private set; }
 
-    public World(GraphicsDevice device, int seed, int renderDistance, WorldStorage storage = null)
+    /// <summary>For tests and tools: called whenever a finished mesh is applied to a chunk, whichever thread built it.</summary>
+    public event Action<Chunk, ChunkMeshData, ChunkMeshData, int> MeshApplied;
+
+    private readonly ChunkWorkers _workers;                       // null = do everything on the calling thread
+    private readonly HashSet<Point> _generating = new();           // chunks a worker is generating right now
+    private int _meshesInFlight;
+    private readonly HashSet<Chunk> _urgent = new();               // chunks touched by an edit: meshed immediately, not queued
+    private bool _editing;
+
+    /// <param name="workerThreads">
+    /// How many background threads generate and mesh chunks. With 0 everything happens on the calling thread, one step per
+    /// <see cref="Update"/> call, which is what tests want (the result doesn't depend on timing).
+    /// </param>
+    public World(GraphicsDevice device, int seed, int renderDistance, WorldStorage storage = null, int workerThreads = 0)
     {
         _device = device;
         _storage = storage;
@@ -36,6 +49,7 @@ public sealed class World
         Generator = new WorldGenerator(seed);
         Lighting = new LightingEngine(this);
         Fluids = new FluidSimulator(this);
+        if (workerThreads > 0) _workers = new ChunkWorkers(workerThreads, Generator, storage);
         _offsets = new List<Point>();
         SetRenderDistance(renderDistance);
     }
@@ -119,12 +133,18 @@ public sealed class World
         if (!liquid) fluidLevel = 0;
         if (chunk.Get(lx, y, lz) == type && (!liquid || chunk.GetFluidLevel(lx, y, lz) == fluidLevel)) return;
 
-        chunk.Set(lx, y, lz, type);
-        chunk.SetFluidLevel(lx, y, lz, fluidLevel);
-        chunk.NeedsSave = true;
-        HasBeenModified = true;
-        MarkMeshDirty(chunk, lx, lz);
-        Lighting.OnBlockChanged(x, y, z, type);
+        // Chunks touched by an edit are meshed straight away (see Update), so the player sees the change on the next frame.
+        _editing = true;
+        try
+        {
+            chunk.Set(lx, y, lz, type);
+            chunk.SetFluidLevel(lx, y, lz, fluidLevel);
+            chunk.NeedsSave = true;
+            HasBeenModified = true;
+            MarkMeshDirty(chunk, lx, lz);
+            Lighting.OnBlockChanged(x, y, z, type);
+        }
+        finally { _editing = false; }
         Fluids.OnBlockChanged(x, y, z);
     }
 
@@ -143,7 +163,8 @@ public sealed class World
     /// </summary>
     public void MarkMeshDirty(Chunk chunk, int lx, int lz)
     {
-        chunk.NeedsMesh = true;
+        chunk.MarkDirty();
+        if (_editing) _urgent.Add(chunk);
 
         int dx = lx == 0 ? -1 : lx == Chunk.Size - 1 ? 1 : 0;
         int dz = lz == 0 ? -1 : lz == Chunk.Size - 1 ? 1 : 0;
@@ -156,7 +177,9 @@ public sealed class World
 
     private void MarkDirty(int chunkX, int chunkZ)
     {
-        if (_chunks.TryGetValue(new Point(chunkX, chunkZ), out var c)) c.NeedsMesh = true;
+        if (!_chunks.TryGetValue(new Point(chunkX, chunkZ), out var c)) return;
+        c.MarkDirty();
+        if (_editing) _urgent.Add(c);
     }
 
     /// <summary>Advances time-based simulation (water flow). Call once per frame.</summary>
@@ -177,10 +200,18 @@ public sealed class World
     public void Update(Vector3 center, int maxGenerate, int maxMesh, double timeBudgetMs = double.MaxValue)
     {
         var clock = System.Diagnostics.Stopwatch.StartNew();
-
         int cx = (int)MathF.Floor(center.X) >> 4;
         int cz = (int)MathF.Floor(center.Z) >> 4;
 
+        if (_workers == null) UpdateInline(cx, cz, maxGenerate, maxMesh, timeBudgetMs, clock);
+        else UpdateWithWorkers(cx, cz, maxGenerate, maxMesh, timeBudgetMs, clock);
+
+        Unload(cx, cz);
+    }
+
+    /// <summary>One thread does everything: simple and deterministic, used by tests.</summary>
+    private void UpdateInline(int cx, int cz, int maxGenerate, int maxMesh, double timeBudgetMs, System.Diagnostics.Stopwatch clock)
+    {
         int generated = 0;
         foreach (var o in _offsets)
         {
@@ -194,10 +225,11 @@ public sealed class World
                 Generator.FillRiverFlow(chunk);   // rivers are not saved, only the blocks
             else
                 Generator.Generate(chunk);
-            _chunks[key] = chunk;
-            Lighting.InitializeChunk(chunk);
+            AddChunk(chunk);
             generated++;
         }
+
+        MeshUrgent(clock, timeBudgetMs);
 
         int meshed = 0;
         int rd2 = RenderDistance * RenderDistance;
@@ -208,11 +240,106 @@ public sealed class World
             if (!_chunks.TryGetValue(new Point(cx + o.X, cz + o.Y), out var chunk)) continue;
             if (!chunk.NeedsMesh || !HasAllNeighbours(chunk)) continue;
 
-            ChunkMesher.Build(chunk, this, _device);
+            BuildMesh(chunk);
             meshed++;
         }
+    }
 
-        // Unload chunks that are well outside the loaded area.
+    /// <summary>
+    /// Worker threads generate and mesh; this thread only hands out the jobs, lights new chunks (which edits the
+    /// neighbouring chunks, so it can't run beside other work) and uploads finished meshes. maxGenerate and maxMesh limit how
+    /// many jobs are handed out per call; timeBudgetMs limits the time spent lighting and uploading.
+    /// </summary>
+    private void UpdateWithWorkers(int cx, int cz, int maxGenerate, int maxMesh, double timeBudgetMs, System.Diagnostics.Stopwatch clock)
+    {
+        int inFlightLimit = _workers.Count * 4;   // enough to keep every thread busy, few enough that stale jobs don't pile up
+
+        // 1. Finished chunks: insert them and light them.
+        int unloadDist = RenderDistance + 4;
+        while (_workers.TryTakeGenerated(out var done))
+        {
+            _generating.Remove(new Point(done.ChunkX, done.ChunkZ));
+            if (done.Chunk == null) continue;   // the worker failed; the chunk is simply requested again below
+            if (Math.Abs(done.ChunkX - cx) > unloadDist || Math.Abs(done.ChunkZ - cz) > unloadDist) continue;   // the player has moved away
+            if (_chunks.ContainsKey(new Point(done.ChunkX, done.ChunkZ))) continue;
+            AddChunk(done.Chunk);
+            if (clock.Elapsed.TotalMilliseconds > timeBudgetMs) break;
+        }
+
+        // 2. Ask for chunks that are missing, nearest first.
+        int requested = 0;
+        foreach (var o in _offsets)
+        {
+            if (requested >= maxGenerate || _generating.Count >= inFlightLimit) break;
+            var key = new Point(cx + o.X, cz + o.Y);
+            if (_chunks.ContainsKey(key) || !_generating.Add(key)) continue;
+            _workers.RequestGenerate(key.X, key.Y);
+            requested++;
+        }
+
+        // 3. Edits are meshed right here, so a broken block disappears on the very next frame.
+        MeshUrgent(clock, timeBudgetMs);
+
+        // 4. Upload finished meshes.
+        while (_workers.TryTakeMeshed(out var meshed))
+        {
+            _meshesInFlight--;
+            meshed.Chunk.MeshInFlight = false;
+            // The chunk may have been unloaded meanwhile. If it was edited, ApplyMesh leaves it marked as needing a new mesh.
+            if (_chunks.TryGetValue(new Point(meshed.Chunk.ChunkX, meshed.Chunk.ChunkZ), out var current) && current == meshed.Chunk)
+                ApplyMesh(meshed.Chunk, meshed.Solid, meshed.Water, meshed.Version);
+            if (clock.Elapsed.TotalMilliseconds > timeBudgetMs) break;
+        }
+
+        // 5. Hand out meshing jobs for chunks that have all their neighbours, nearest first.
+        int queued = 0;
+        int rd2 = RenderDistance * RenderDistance;
+        foreach (var o in _offsets)
+        {
+            if (queued >= maxMesh || _meshesInFlight >= inFlightLimit) break;
+            if (o.X * o.X + o.Y * o.Y > rd2) continue;
+            if (!_chunks.TryGetValue(new Point(cx + o.X, cz + o.Y), out var chunk)) continue;
+            if (!chunk.NeedsMesh || chunk.MeshInFlight) continue;
+
+            var neighbourhood = ChunkNeighborhood.Capture(this, chunk);
+            if (neighbourhood == null) continue;
+
+            chunk.MeshInFlight = true;
+            _meshesInFlight++;
+            queued++;
+            _workers.RequestMesh(new MeshRequest { Chunk = chunk, Neighborhood = neighbourhood, Version = chunk.Version });
+        }
+    }
+
+    /// <summary>Inserts a freshly generated chunk and lights it.</summary>
+    private void AddChunk(Chunk chunk)
+    {
+        _chunks[new Point(chunk.ChunkX, chunk.ChunkZ)] = chunk;
+        Lighting.InitializeChunk(chunk);
+    }
+
+    /// <summary>Meshes the chunks an edit touched, on this thread, within the time budget (the rest wait for the next frame).</summary>
+    private void MeshUrgent(System.Diagnostics.Stopwatch clock, double timeBudgetMs)
+    {
+        if (_urgent.Count == 0) return;
+        List<Chunk> finished = null;
+        foreach (var chunk in _urgent)
+        {
+            bool loaded = _chunks.TryGetValue(new Point(chunk.ChunkX, chunk.ChunkZ), out var current) && current == chunk;
+            if (loaded && chunk.NeedsMesh && !chunk.MeshInFlight)
+            {
+                if (clock.Elapsed.TotalMilliseconds > Math.Max(timeBudgetMs, 4)) break;
+                if (!BuildMesh(chunk)) continue;   // neighbours missing: try again next frame
+            }
+            // Done, unloaded, or already being meshed by a worker (its result will be stale, so it gets rebuilt).
+            (finished ??= new List<Chunk>()).Add(chunk);
+        }
+        if (finished != null) foreach (var chunk in finished) _urgent.Remove(chunk);
+    }
+
+    /// <summary>Unloads chunks that are well outside the loaded area, saving any with changes.</summary>
+    private void Unload(int cx, int cz)
+    {
         int unloadDist = RenderDistance + 4;
         _unloadScratch.Clear();
         foreach (var (key, _) in _chunks)
@@ -223,8 +350,28 @@ public sealed class World
             SaveChunk(_chunks[key]);
             _chunks[key].Dispose();
             _chunks.Remove(key);
+            MeshRevision++;
         }
     }
+
+    /// <summary>
+    /// Loads everything around a position and waits for it to finish. Used at start-up, so the first frame shows a complete
+    /// world. With worker threads this is where they pay off: the waiting is spent generating and meshing in parallel.
+    /// </summary>
+    public void LoadAll(Vector3 center)
+    {
+        while (true)
+        {
+            Update(center, int.MaxValue, int.MaxValue);
+            if (_generating.Count == 0 && _meshesInFlight == 0 && CountPendingWork(center) == 0) break;
+            Thread.Sleep(1);
+        }
+    }
+
+    /// <summary>Chunks being generated or meshed by worker threads right now.</summary>
+    public int WorkInFlight => _generating.Count + _meshesInFlight;
+
+    public void Dispose() => _workers?.Dispose();
 
     // ---- Saving ----
 
@@ -242,6 +389,46 @@ public sealed class World
         if (_storage == null || !chunk.NeedsSave) return;
         _storage.SaveChunk(chunk);
         chunk.NeedsSave = false;
+    }
+
+    /// <summary>How much loading work is left around the last position: chunks not yet generated plus meshes not yet built.</summary>
+    public int CountPendingWork(Vector3 center)
+    {
+        int cx = (int)MathF.Floor(center.X) >> 4, cz = (int)MathF.Floor(center.Z) >> 4;
+        int pending = 0, rd2 = RenderDistance * RenderDistance;
+        foreach (var o in _offsets)
+        {
+            if (!_chunks.TryGetValue(new Point(cx + o.X, cz + o.Y), out var chunk)) { pending++; continue; }
+            if (o.X * o.X + o.Y * o.Y <= rd2 && (chunk.NeedsMesh || chunk.MeshInFlight) && HasAllNeighbours(chunk)) pending++;
+        }
+        return pending;
+    }
+
+    private readonly ChunkMesher _mesher = new();
+
+    /// <summary>
+    /// Builds a chunk's mesh right now, on the calling thread, and uploads it. Needs all eight neighbours loaded.
+    /// (Without a graphics device, as in tests, the mesh is built and discarded; the chunk is still marked as meshed.)
+    /// </summary>
+    public bool BuildMesh(Chunk chunk)
+    {
+        var neighbourhood = ChunkNeighborhood.Capture(this, chunk);
+        if (neighbourhood == null) return false;
+
+        int version = chunk.Version;
+        var solid = _mesher.Build(neighbourhood, out var water);
+        ApplyMesh(chunk, solid, water, version);
+        return true;
+    }
+
+    /// <summary>Increases whenever any chunk's mesh changes or a chunk is unloaded; lets the renderer know when its shadow map is out of date.</summary>
+    public int MeshRevision { get; private set; }
+
+    private void ApplyMesh(Chunk chunk, ChunkMeshData solid, ChunkMeshData water, int version)
+    {
+        MeshRevision++;
+        chunk.ApplyMesh(_device, solid, water, version);
+        MeshApplied?.Invoke(chunk, solid, water, version);
     }
 
     private bool HasAllNeighbours(Chunk c)

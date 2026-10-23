@@ -7,6 +7,10 @@
     <Nullable>disable</Nullable>
     <RootNamespace>VoxelGame</RootNamespace>
     <AssemblyName>VoxelGame</AssemblyName>
+
+    <!-- `dotnet run` builds Debug by default, which is several times slower. Optimise Debug too (symbols are still kept, so
+         stepping through code mostly works); use `-c Release` for the very last bit of speed. -->
+    <Optimize>true</Optimize>
   </PropertyGroup>
 
   <ItemGroup>

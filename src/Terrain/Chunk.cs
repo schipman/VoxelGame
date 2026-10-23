@@ -34,8 +34,30 @@ public sealed class Chunk : IDisposable
     /// <summary>True when blocks changed since this chunk was last saved (or loaded).</summary>
     public bool NeedsSave { get; set; }
 
+    /// <summary>
+    /// Counts every change to the blocks or light. A mesh remembers the version it was built from, so a mesh built on a
+    /// worker thread can never wrongly mark a chunk as up to date if it was edited while the mesh was being made.
+    /// Only ever changed on the main thread.
+    /// </summary>
+    public int Version { get; private set; } = 1;
+
+    /// <summary>The version the current meshes were built from (0 = never meshed).</summary>
+    public int MeshedVersion { get; private set; }
+
     /// <summary>True when the blocks or light changed since the meshes were last built.</summary>
-    public bool NeedsMesh { get; set; } = true;
+    public bool NeedsMesh => MeshedVersion != Version;
+
+    /// <summary>True while a worker thread is building a mesh for this chunk.</summary>
+    public bool MeshInFlight { get; set; }
+
+    /// <summary>Flags the meshes as out of date.</summary>
+    public void MarkDirty() => Version++;
+
+    /// <summary>
+    /// One more than the highest non-air block's height: everything above is empty sky. The mesher stops there instead of
+    /// scanning all 128 layers. It only ever grows (breaking a block never lowers it), which is safe: it is just an upper bound.
+    /// </summary>
+    public int TopY { get; private set; }
 
     /// <summary>The solid terrain and everything that isn't water.</summary>
     public ChunkMesh Mesh { get; } = new();
@@ -63,7 +85,8 @@ public sealed class Chunk : IDisposable
     public void Set(int x, int y, int z, BlockType type)
     {
         _blocks[Index(x, y, z)] = type;
-        NeedsMesh = true;
+        if (type != BlockType.Air && y >= TopY) TopY = y + 1;
+        Version++;
     }
 
     /// <summary>All blocks in storage order, for saving.</summary>
@@ -73,7 +96,11 @@ public sealed class Chunk : IDisposable
     public void LoadBlocks(ReadOnlySpan<BlockType> blocks)
     {
         blocks.CopyTo(_blocks);
-        NeedsMesh = true;
+
+        TopY = 0;
+        for (int i = blocks.Length - 1; i >= 0; i--)
+            if (blocks[i] != BlockType.Air) { TopY = i / (Size * Size) + 1; break; }
+        Version++;
     }
 
     // ---- Light ----
@@ -125,20 +152,39 @@ public sealed class Chunk : IDisposable
 
     // ---- Meshes ----
 
-    /// <summary>Replaces the GPU buffers of both meshes with freshly built ones.</summary>
-    public void SetMeshes(GraphicsDevice device,
-        List<VoxelVertex> vertices, List<int> indices,
-        List<VoxelVertex> waterVertices, List<int> waterIndices)
+    /// <summary>
+    /// Replaces the GPU buffers with a mesh built from the chunk as it was at <paramref name="version"/>. If the chunk has
+    /// changed since, it stays flagged as needing a new mesh. Must run on the main thread (it creates GPU buffers).
+    /// </summary>
+    public void ApplyMesh(GraphicsDevice device, ChunkMeshData solid, ChunkMeshData water, int version)
     {
-        Mesh.Set(device, vertices, indices);
-        WaterMesh.Set(device, waterVertices, waterIndices);
-        NeedsMesh = false;
+        if (device != null)
+        {
+            Mesh.Set(device, solid);
+            WaterMesh.Set(device, water);
+        }
+        MeshedVersion = version;
     }
 
     public void Dispose()
     {
         Mesh.Dispose();
         WaterMesh.Dispose();
+    }
+}
+
+/// <summary>Vertices and triangle indices for one batch of geometry, built on the CPU (any thread).</summary>
+public sealed class ChunkMeshData
+{
+    public static readonly ChunkMeshData Empty = new(Array.Empty<VoxelVertex>(), Array.Empty<int>());
+
+    public VoxelVertex[] Vertices { get; }
+    public int[] Indices { get; }
+
+    public ChunkMeshData(VoxelVertex[] vertices, int[] indices)
+    {
+        Vertices = vertices;
+        Indices = indices;
     }
 }
 
@@ -150,17 +196,29 @@ public sealed class ChunkMesh : IDisposable
     public int IndexCount { get; private set; }
     public int VertexCount { get; private set; }
 
-    public void Set(GraphicsDevice device, List<VoxelVertex> vertices, List<int> indices)
+    public void Set(GraphicsDevice device, ChunkMeshData data)
     {
         Dispose();
-        VertexCount = vertices.Count;
-        IndexCount = indices.Count;
-        if (indices.Count == 0) return;
+        VertexCount = data.Vertices.Length;
+        IndexCount = data.Indices.Length;
+        if (IndexCount == 0) return;
 
-        VertexBuffer = new VertexBuffer(device, VoxelVertex.VertexDeclaration, vertices.Count, BufferUsage.WriteOnly);
-        VertexBuffer.SetData(vertices.ToArray());
-        IndexBuffer = new IndexBuffer(device, IndexElementSize.ThirtyTwoBits, indices.Count, BufferUsage.WriteOnly);
-        IndexBuffer.SetData(indices.ToArray());
+        VertexBuffer = new VertexBuffer(device, VoxelVertex.VertexDeclaration, VertexCount, BufferUsage.WriteOnly);
+        VertexBuffer.SetData(data.Vertices);
+
+        // Most chunks have under 65,536 vertices, so 16-bit indices (half the size) are enough.
+        if (VertexCount <= ushort.MaxValue)
+        {
+            var small = new ushort[IndexCount];
+            for (int i = 0; i < small.Length; i++) small[i] = (ushort)data.Indices[i];
+            IndexBuffer = new IndexBuffer(device, IndexElementSize.SixteenBits, IndexCount, BufferUsage.WriteOnly);
+            IndexBuffer.SetData(small);
+        }
+        else
+        {
+            IndexBuffer = new IndexBuffer(device, IndexElementSize.ThirtyTwoBits, IndexCount, BufferUsage.WriteOnly);
+            IndexBuffer.SetData(data.Indices);
+        }
     }
 
     public void Dispose()
@@ -170,5 +228,6 @@ public sealed class ChunkMesh : IDisposable
         VertexBuffer = null;
         IndexBuffer = null;
         IndexCount = 0;
+        VertexCount = 0;
     }
 }

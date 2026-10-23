@@ -52,11 +52,15 @@ public sealed class LightingEngine
 
         // Sunlight falls straight down every column until it hits something opaque. Full-strength light
         // passes through air unchanged; once something has dimmed it (leaves), it fades one level per block.
+        // Above the highest block everything is open sky, so that part is filled without looking at any blocks.
+        int top = Math.Min(chunk.TopY, Chunk.Height);
         for (int x = 0; x < Chunk.Size; x++)
         for (int z = 0; z < Chunk.Size; z++)
         {
+            for (int y = Chunk.Height - 1; y >= top; y--) chunk.SetSkyLight(x, y, z, MaxLight);
+
             int level = MaxLight;
-            for (int y = Chunk.Height - 1; y >= 0 && level > 0; y--)
+            for (int y = top - 1; y >= 0 && level > 0; y--)
             {
                 var type = chunk.Get(x, y, z);
                 if (BlockRegistry.IsOpaque(type)) break;
@@ -66,7 +70,7 @@ public sealed class LightingEngine
         }
 
         // Emissive blocks light themselves.
-        for (int y = 0; y < Chunk.Height; y++)
+        for (int y = 0; y < top; y++)
         for (int z = 0; z < Chunk.Size; z++)
         for (int x = 0; x < Chunk.Size; x++)
         {
@@ -74,10 +78,14 @@ public sealed class LightingEngine
             if (emission > 0) chunk.SetBlockLight(x, y, z, emission);
         }
 
+        // Cells above every nearby block are uniformly sunlit and can't brighten anything, so only the layers up to the
+        // tallest of this chunk and its four neighbours (plus a margin) need checking.
+        int scanTop = Math.Min(Chunk.Height, Math.Max(chunk.TopY, NeighbourTop(chunk)) + 2);
+
         foreach (var channel in new[] { LightChannel.Sky, LightChannel.Block })
         {
             // Seeds: cells of this chunk that can brighten a neighbour...
-            for (int y = 0; y < Chunk.Height; y++)
+            for (int y = 0; y < scanTop; y++)
             for (int z = 0; z < Chunk.Size; z++)
             for (int x = 0; x < Chunk.Size; x++)
             {
@@ -89,7 +97,7 @@ public sealed class LightingEngine
 
             // ...and the border cells of loaded neighbours, which may now spill into this chunk.
             for (int i = 0; i < Chunk.Size; i++)
-            for (int y = 0; y < Chunk.Height; y++)
+            for (int y = 0; y < scanTop; y++)
             {
                 SeedBorder(channel, chunk.WorldX - 1,         y, chunk.WorldZ + i);
                 SeedBorder(channel, chunk.WorldX + Chunk.Size, y, chunk.WorldZ + i);
@@ -99,6 +107,15 @@ public sealed class LightingEngine
 
             Spread(channel);
         }
+    }
+
+    /// <summary>The highest TopY among the four chunks next to this one (0 for any that aren't loaded).</summary>
+    private int NeighbourTop(Chunk chunk)
+    {
+        int top = 0;
+        foreach (var (dx, dz) in new[] { (1, 0), (-1, 0), (0, 1), (0, -1) })
+            if (_world.TryGetChunk(chunk.ChunkX + dx, chunk.ChunkZ + dz, out var n)) top = Math.Max(top, n.TopY);
+        return top;
     }
 
     /// <summary>

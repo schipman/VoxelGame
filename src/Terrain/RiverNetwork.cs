@@ -69,6 +69,10 @@ public sealed class RiverNetwork
     public int[] TracesByDepth { get; } = new int[MaxForkDepth + 1];
     public int[] SeaByDepth { get; } = new int[MaxForkDepth + 1];
 
+    // Regions are traced the first time anything needs them, so these fill in as the world is explored. Chunks are generated
+    // on several threads at once, so everything that reads or builds them happens under this lock.
+    private readonly object _sync = new();
+
     private readonly HashSet<(int, int)> _traced = new();
     private readonly HashSet<(int, int)> _ready = new();
     private readonly Dictionary<(int, int), List<Segment>> _grid = new();
@@ -101,6 +105,11 @@ public sealed class RiverNetwork
     /// Safe to call from anywhere; it traces whatever regions it needs on first use.
     /// </summary>
     public RiverSample? Query(int x, int z)
+    {
+        lock (_sync) return QueryLocked(x, z);
+    }
+
+    private RiverSample? QueryLocked(int x, int z)
     {
         EnsureAround(x, z);
         if (!_grid.TryGetValue((FloorDiv(x, GridCell), FloorDiv(z, GridCell)), out var segments)) return null;

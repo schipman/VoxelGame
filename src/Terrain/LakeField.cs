@@ -36,6 +36,7 @@ public sealed class LakeField
     private readonly Func<int, int, float> _continentalness;
     private readonly PerlinNoise _outline;
     private readonly Dictionary<(int, int), Lake?> _cells = new();
+    private readonly object _sync = new();   // cells are decided on first use, from any generator thread
 
     /// <summary>For tuning and tests: how many grid cells have been decided, and how many of them got a lake.</summary>
     public int CellsDecided { get; private set; }
@@ -61,6 +62,11 @@ public sealed class LakeField
 
     /// <summary>The lake whose shore is nearest to a point (counting only ones near enough to matter), or null.</summary>
     public LakeSample? Query(int x, int z)
+    {
+        lock (_sync) return QueryLocked(x, z);
+    }
+
+    private LakeSample? QueryLocked(int x, int z)
     {
         int cx = FloorDiv(x, _cellSize), cz = FloorDiv(z, _cellSize);
         LakeSample? best = null;
