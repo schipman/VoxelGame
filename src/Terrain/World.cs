@@ -1,0 +1,202 @@
+using Microsoft.Xna.Framework;
+using Microsoft.Xna.Framework.Graphics;
+using VoxelGame.Blocks;
+using VoxelGame.Persistence;
+using VoxelGame.Rendering;
+
+namespace VoxelGame.Terrain;
+
+/// <summary>
+/// The set of loaded chunks. Everything outside this class talks in world block coordinates;
+/// the chunk lookup is handled here.
+/// </summary>
+public sealed class World
+{
+    private readonly Dictionary<Point, Chunk> _chunks = new();
+    private readonly GraphicsDevice _device;
+    private readonly WorldStorage _storage;   // null = nothing is saved or loaded
+    private readonly List<Point> _offsets;   // chunk offsets around the player, nearest first
+    private readonly List<Point> _unloadScratch = new();
+
+    public int RenderDistance { get; }
+    public IReadOnlyCollection<Chunk> Chunks => _chunks.Values;
+    public WorldGenerator Generator { get; }
+    public LightingEngine Lighting { get; }
+    public int Seed { get; }
+
+    /// <summary>True once any block has been changed in this session; used to avoid saving untouched worlds.</summary>
+    public bool HasBeenModified { get; private set; }
+
+    public World(GraphicsDevice device, int seed, int renderDistance, WorldStorage storage = null)
+    {
+        _device = device;
+        _storage = storage;
+        Seed = seed;
+        Generator = new WorldGenerator(seed);
+        Lighting = new LightingEngine(this);
+        RenderDistance = renderDistance;
+
+        // Two extra rings are generated (but not meshed): a mesh samples blocks and light from all 8
+        // surrounding chunks (smooth lighting and ambient occlusion look one block past every edge).
+        int r = renderDistance + 2;
+        _offsets = new List<Point>();
+        for (int dx = -r; dx <= r; dx++)
+            for (int dz = -r; dz <= r; dz++)
+                if (dx * dx + dz * dz <= r * r)
+                    _offsets.Add(new Point(dx, dz));
+        _offsets.Sort((a, b) => (a.X * a.X + a.Y * a.Y).CompareTo(b.X * b.X + b.Y * b.Y));
+    }
+
+    public bool TryGetChunk(int chunkX, int chunkZ, out Chunk chunk) => _chunks.TryGetValue(new Point(chunkX, chunkZ), out chunk);
+
+    // ---- Block access (world coordinates) ----
+
+    public BlockType GetBlock(int x, int y, int z)
+    {
+        if (y < 0 || y >= Chunk.Height) return BlockType.Air;
+        if (!_chunks.TryGetValue(new Point(x >> 4, z >> 4), out var chunk)) return BlockType.Air;
+        return chunk.Get(x & 15, y, z & 15);
+    }
+
+    /// <summary>Block plus both light levels in one lookup; used by the mesher.</summary>
+    public void GetCell(int x, int y, int z, out BlockType type, out int skyLight, out int blockLight)
+    {
+        if (y >= Chunk.Height) { type = BlockType.Air; skyLight = LightingEngine.MaxLight; blockLight = 0; return; }
+        if (y < 0 || !_chunks.TryGetValue(new Point(x >> 4, z >> 4), out var chunk))
+        {
+            type = BlockType.Air; skyLight = 0; blockLight = 0;
+            return;
+        }
+        int lx = x & 15, lz = z & 15;
+        type = chunk.Get(lx, y, lz);
+        skyLight = chunk.GetSkyLight(lx, y, lz);
+        blockLight = chunk.GetBlockLight(lx, y, lz);
+    }
+
+    public void SetBlock(int x, int y, int z, BlockType type)
+    {
+        if (y < 0 || y >= Chunk.Height) return;
+        if (!_chunks.TryGetValue(new Point(x >> 4, z >> 4), out var chunk)) return;
+
+        int lx = x & 15, lz = z & 15;
+        if (chunk.Get(lx, y, lz) == type) return;
+
+        chunk.Set(lx, y, lz, type);
+        chunk.NeedsSave = true;
+        HasBeenModified = true;
+        MarkMeshDirty(chunk, lx, lz);
+        Lighting.OnBlockChanged(x, y, z, type);
+    }
+
+    /// <summary>Solid for collision purposes. Unloaded chunks count as solid so nothing falls into the void.</summary>
+    public bool IsSolid(int x, int y, int z)
+    {
+        if (y < 0) return true;
+        if (y >= Chunk.Height) return false;
+        if (!_chunks.TryGetValue(new Point(x >> 4, z >> 4), out var chunk)) return true;
+        return BlockRegistry.Get(chunk.Get(x & 15, y, z & 15)).IsSolid;
+    }
+
+    /// <summary>
+    /// Flags a chunk for re-meshing after a block or light change at (lx, lz). Meshes read one cell
+    /// past their edges, so changes on an edge or corner also dirty the chunks next to it.
+    /// </summary>
+    public void MarkMeshDirty(Chunk chunk, int lx, int lz)
+    {
+        chunk.NeedsMesh = true;
+
+        int dx = lx == 0 ? -1 : lx == Chunk.Size - 1 ? 1 : 0;
+        int dz = lz == 0 ? -1 : lz == Chunk.Size - 1 ? 1 : 0;
+        if (dx == 0 && dz == 0) return;
+
+        if (dx != 0) MarkDirty(chunk.ChunkX + dx, chunk.ChunkZ);
+        if (dz != 0) MarkDirty(chunk.ChunkX, chunk.ChunkZ + dz);
+        if (dx != 0 && dz != 0) MarkDirty(chunk.ChunkX + dx, chunk.ChunkZ + dz);
+    }
+
+    private void MarkDirty(int chunkX, int chunkZ)
+    {
+        if (_chunks.TryGetValue(new Point(chunkX, chunkZ), out var c)) c.NeedsMesh = true;
+    }
+
+    // ---- Streaming ----
+
+    /// <summary>
+    /// Generates, meshes and unloads chunks around a position. The budgets cap the work done per call
+    /// so the frame rate stays smooth; pass int.MaxValue to load everything at once (e.g. at startup).
+    /// </summary>
+    public void Update(Vector3 center, int maxGenerate, int maxMesh)
+    {
+        int cx = (int)MathF.Floor(center.X) >> 4;
+        int cz = (int)MathF.Floor(center.Z) >> 4;
+
+        int generated = 0;
+        foreach (var o in _offsets)
+        {
+            if (generated >= maxGenerate) break;
+            var key = new Point(cx + o.X, cz + o.Y);
+            if (_chunks.ContainsKey(key)) continue;
+
+            var chunk = new Chunk(key.X, key.Y);
+            // A chunk the player edited comes from disk; anything else is generated from the seed.
+            if (_storage == null || !_storage.TryLoadChunk(chunk))
+                Generator.Generate(chunk);
+            _chunks[key] = chunk;
+            Lighting.InitializeChunk(chunk);
+            generated++;
+        }
+
+        int meshed = 0;
+        int rd2 = RenderDistance * RenderDistance;
+        foreach (var o in _offsets)
+        {
+            if (meshed >= maxMesh) break;
+            if (o.X * o.X + o.Y * o.Y > rd2) continue;
+            if (!_chunks.TryGetValue(new Point(cx + o.X, cz + o.Y), out var chunk)) continue;
+            if (!chunk.NeedsMesh || !HasAllNeighbours(chunk)) continue;
+
+            ChunkMesher.Build(chunk, this, _device);
+            meshed++;
+        }
+
+        // Unload chunks that are well outside the loaded area.
+        int unloadDist = RenderDistance + 4;
+        _unloadScratch.Clear();
+        foreach (var (key, _) in _chunks)
+            if (Math.Abs(key.X - cx) > unloadDist || Math.Abs(key.Y - cz) > unloadDist)
+                _unloadScratch.Add(key);
+        foreach (var key in _unloadScratch)
+        {
+            SaveChunk(_chunks[key]);
+            _chunks[key].Dispose();
+            _chunks.Remove(key);
+        }
+    }
+
+    // ---- Saving ----
+
+    /// <summary>Writes every changed chunk to disk. Returns how many were saved.</summary>
+    public int SaveModifiedChunks()
+    {
+        int saved = 0;
+        foreach (var chunk in _chunks.Values)
+            if (chunk.NeedsSave) { SaveChunk(chunk); saved++; }
+        return saved;
+    }
+
+    private void SaveChunk(Chunk chunk)
+    {
+        if (_storage == null || !chunk.NeedsSave) return;
+        _storage.SaveChunk(chunk);
+        chunk.NeedsSave = false;
+    }
+
+    private bool HasAllNeighbours(Chunk c)
+    {
+        for (int dx = -1; dx <= 1; dx++)
+            for (int dz = -1; dz <= 1; dz++)
+                if ((dx != 0 || dz != 0) && !_chunks.ContainsKey(new Point(c.ChunkX + dx, c.ChunkZ + dz)))
+                    return false;
+        return true;
+    }
+}
