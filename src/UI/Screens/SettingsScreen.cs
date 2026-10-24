@@ -29,6 +29,7 @@ public sealed class SettingsScreen : UiScreen
         menu.Add(new CycleButton("UI scale", UiScaleNames, settings.UiScale, i => settings.UiScale = i));
         menu.Add(new CycleButton("Fullscreen", OnOff, settings.Fullscreen ? 1 : 0, i => settings.Fullscreen = i == 1));
         menu.Add(new CycleButton("Shadows", OnOff, settings.Shadows ? 1 : 0, i => settings.Shadows = i == 1));
+        menu.Add(new Button("Visual effects...", () => Ui.Open(new EffectsScreen(settings)), 200));
         menu.Add(new CycleButton("Debug text", OnOff, settings.ShowDebugText ? 1 : 0, i => settings.ShowDebugText = i == 1));
         menu.Add(new CycleButton("Game mode", new[] { "Creative", "Survival" }, (int)settings.GameMode, i => settings.GameMode = (GameMode)i));
         menu.Add(new Label("") { Size = new Microsoft.Xna.Framework.Point(1, 2) });

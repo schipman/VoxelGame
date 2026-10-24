@@ -390,6 +390,13 @@ public sealed class VoxelGameApp : Game
         // Settings take effect straight away.
         ApplyFullscreen();
         _renderer.ShadowsEnabled = _settings.Shadows;
+        _renderer.Post.Bloom.Intensity = _settings.Bloom / 100f * 1.5f;
+        _renderer.Post.Vignette.Strength = _settings.Vignette / 100f;
+        _renderer.Post.GodRays.Intensity = _settings.GodRays / 100f;
+        _renderer.Post.Grade.Saturation = _settings.Saturation / 100f;
+        _renderer.Post.Tonemap.Enabled = _settings.Tonemap > 0;
+        _renderer.Post.Tonemap.Punch = _settings.Tonemap == 2 ? 0.8f : 0.35f;
+        _renderer.Post.Tonemap.Exposure = _settings.TonemapExposure / 100f;
         _camera.FieldOfView = MathHelper.ToRadians(_settings.FieldOfView);
         if (_session?.World != null)
         {
@@ -602,12 +609,12 @@ public sealed class VoxelGameApp : Game
         // The world is drawn off screen and copied to the window at the end; see WorldRenderer.
         _renderer.Prepare(_world, _camera, _sky, _ui.PausesGame ? 0f : dt);   // ripples and shadows: these switch render targets, so they go first
         _renderer.BeginScene(_sky);
-        if (!_renderer.CameraUnderwater) _celestials.Draw(_camera, _sky);
+        if (!_renderer.CameraUnderwater) _celestials.Draw(_camera, _sky, _renderer.Post.WantsHdr);
         _renderer.DrawTerrain(_world, _camera, _sky);
         _avatars.Draw(_session.Others, _camera);
         _renderer.DrawWater(_world, _camera, _sky, _player.Position);
         if (_interaction.Target is { } target && !_ui.HasScreen) _outline.Draw(target, _camera);
-        _renderer.Present();
+        _renderer.Present(_camera, _sky);
 
         DrawNameTags();
         _ui.Draw();

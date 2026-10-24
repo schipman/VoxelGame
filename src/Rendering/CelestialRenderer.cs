@@ -17,6 +17,21 @@ public sealed class CelestialRenderer
         ColorWriteChannels = ColorWriteChannels.Red | ColorWriteChannels.Green | ColorWriteChannels.Blue,
     };
 
+    // Adds light on top of what is there (again leaving the distance in alpha alone). Used to push things past white.
+    private static readonly BlendState AddScene = new()
+    {
+        ColorSourceBlend = Blend.One,
+        ColorDestinationBlend = Blend.One,
+        AlphaSourceBlend = Blend.Zero,
+        AlphaDestinationBlend = Blend.One,
+        ColorWriteChannels = ColorWriteChannels.Red | ColorWriteChannels.Green | ColorWriteChannels.Blue,
+    };
+
+    // How many times brighter than white each thing is when the post-processing can use it (bloom, tone mapping).
+    private const float SunBrightness = 6f;
+    private const float MoonBrightness = 3f;
+    private const float StarBrightness = 4f;
+
     private readonly SpriteBatch _batch;
     private readonly Texture2D _pixel;
     private readonly Vector3[] _stars;
@@ -38,28 +53,53 @@ public sealed class CelestialRenderer
         }
     }
 
-    public void Draw(Camera camera, DayNightCycle sky)
+    /// <param name="hdr">
+    /// Draw the sun, moon and stars brighter than white. The picture can't show that directly, so only do it when bloom or
+    /// tone mapping will make use of it (otherwise they would just be clipped to white).
+    /// </param>
+    public void Draw(Camera camera, DayNightCycle sky, bool hdr = false)
     {
         var viewProjection = camera.View * camera.Projection;
         var viewport = _batch.GraphicsDevice.Viewport;
 
-        _batch.Begin(blendState: SceneBlend, samplerState: SamplerState.PointClamp);
-
         float night = 1f - sky.Daylight;
-        if (night > 0.05f)
-        {
-            foreach (var star in _stars)
-                if (Project(star, camera.Position, viewProjection, viewport, out var p))
-                    _batch.Draw(_pixel, new Rectangle((int)p.X, (int)p.Y, 2, 2), Color.White * (night * night * 0.9f));
-        }
+        float starAlpha = night * night * 0.9f;
+        bool anyStars = night > 0.05f;
+        bool sunVisible = Project(sky.SunDirection, camera.Position, viewProjection, viewport, out var sun);
+        bool moonVisible = Project(-sky.SunDirection, camera.Position, viewProjection, viewport, out var moon);   // always opposite the sun
 
-        // Sun is always opposite the moon.
-        if (Project(sky.SunDirection, camera.Position, viewProjection, viewport, out var sun))
-            DrawSquare(sun, 56, new Color(255, 244, 200));
-        if (Project(-sky.SunDirection, camera.Position, viewProjection, viewport, out var moon))
-            DrawSquare(moon, 40, new Color(215, 225, 245));
+        var sunColor = new Color(255, 244, 200);
+        var moonColor = new Color(215, 225, 245);
 
+        _batch.Begin(blendState: SceneBlend, samplerState: SamplerState.PointClamp);
+        if (anyStars) DrawStars(camera, viewProjection, viewport, Color.White * starAlpha);
+        if (sunVisible) DrawSquare(sun, 56, sunColor);
+        if (moonVisible) DrawSquare(moon, 40, moonColor);
         _batch.End();
+
+        if (!hdr) return;
+
+        // Go past white by adding the same shapes again, once per whole unit of extra brightness. The moon and stars fade
+        // in with the dark, so the moon doesn't glare against a bright daytime sky.
+        _batch.Begin(blendState: AddScene, samplerState: SamplerState.PointClamp);
+        if (anyStars) AddBrightness(StarBrightness - 1f, f => DrawStars(camera, viewProjection, viewport, Color.White * (starAlpha * f)));
+        if (sunVisible) AddBrightness(SunBrightness - 1f, f => DrawSquare(sun, 56, sunColor * f));
+        if (moonVisible) AddBrightness((MoonBrightness - 1f) * night * night, f => DrawSquare(moon, 40, moonColor * f));
+        _batch.End();
+    }
+
+    /// <summary>Calls <paramref name="draw"/> with 1 for each whole unit of <paramref name="extra"/>, then once more with the remainder.</summary>
+    private static void AddBrightness(float extra, Action<float> draw)
+    {
+        for (; extra >= 1f; extra -= 1f) draw(1f);
+        if (extra > 0.01f) draw(extra);
+    }
+
+    private void DrawStars(Camera camera, Matrix viewProjection, Viewport viewport, Color color)
+    {
+        foreach (var star in _stars)
+            if (Project(star, camera.Position, viewProjection, viewport, out var p))
+                _batch.Draw(_pixel, new Rectangle((int)p.X, (int)p.Y, 2, 2), color);
     }
 
     private void DrawSquare(Vector2 center, int size, Color color) =>

@@ -28,6 +28,7 @@ float3 LightDirection;      // unit vector pointing TOWARD the sun (or moon at n
 float3 LightColor;          // direct light colour * intensity; black means no direct light
 float3 AmbientColor;        // sky ambient colour for the current time of day
 float3 BlockLightColor;     // tint of lamp light
+float EmissiveIntensity;    // brightness of lamp faces: 1 = plain white; above 1 when post-processing can use the extra (bloom, tone mapping)
 float3 FogColor;
 float FogStart;
 float FogEnd;
@@ -189,7 +190,7 @@ float4 MainPS(VSOutput input) : COLOR0
     direct += LightColor * ndl * shadow * submerged * Caustics(input.WorldPos, N) * exp(-waterDepth * 0.2) * smoothstep(0.55, 0.9, surfaceSky);
 
     float3 light = (ambient + lamps + direct) * ao;
-    light = lerp(light, float3(1.0, 1.0, 1.0), emissive);
+    light = lerp(light, float3(1.0, 1.0, 1.0) * EmissiveIntensity, emissive);
 
     float3 color = tex.rgb * light;
 

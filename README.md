@@ -155,6 +155,23 @@ Oceans fill up to sea level (y=46) and cover about a third of the world (median 
 occurs in `BiomeSource`. **Adding a tree:** add a `TreeKind` and a shape in `TreeBuilder`, new log/leaf blocks if needed.
 Worlds saved with an older generator will show a warning: their edited chunks won't match the new terrain.
 
+## Post-processing
+
+The finished scene (still an unclamped half-float image) passes through a stack of full-screen effects on its way to the
+window (`src/Rendering/PostProcess/`, shader `Content/Shaders/Post.fx`). They run in this order (god rays first, then bloom, while the scene is still unclamped) and cost nothing when off:
+
+| Effect | What it does | Setting |
+|---|---|---|
+| God rays | light shafts fanning out from the sun and moon around hills and trees (radial blur of the sky light, at half resolution; first in the stack because it reads the scene's distance channel to tell sky from terrain) | God rays 0-100% |
+| Bloom | bright things (sun, lamps, glints) glow; a chain of shrinking blurred copies keeps it cheap | Bloom 0-100% |
+| AgX tone mapping | filmic curve that squeezes the unclamped scene into a screen's range, keeping detail in highlights and shadows; on by default, with a punchier variant and an exposure slider (the sun, moon, stars and lamps are drawn brighter than white so they have somewhere to roll off to) | Visual effects: Tone mapping Off / AgX / AgX punchy, Exposure 25-400% |
+| Colour grade | exposure, contrast, saturation (skipped while all are at their defaults) | Saturation 0-200% |
+| Vignette | darkens the corners; a bit stronger under water | Vignette 0-100% |
+
+All of them are in the settings menu under **Visual effects...**. **To add an effect:** write a `PostEffect` subclass (`Apply` runs one or more
+passes with `context.Pass(target, "TechniqueName", source)`), add the technique to `Post.fx`, and add it to
+`PostProcessor.Effects` where you want it in the order. The UI is drawn after the stack, so it is never blurred or tinted.
+
 ## Water
 
 **Looks** (`Content/Shaders/Water.fx`, `Assets/Textures/water_normal.png`). The world is drawn first into an off-screen
@@ -251,6 +268,7 @@ Assets/Textures/blocks.png   the block texture atlas (edit me)
 Content/Shaders/Voxel.fx    terrain shader (lighting, shadows, caustics)
 Content/Shaders/Water.fx    water surface shader
 Content/Shaders/Ripples.fx  ripple simulation step
+Content/Shaders/Post.fx     full-screen post-processing passes
 src/
   VoxelGameApp.cs        Game loop; owns and orders the systems
   ServerHost.cs          Windowless dedicated server (--server)
@@ -285,7 +303,8 @@ src/
     FullscreenQuad.cs    draws a shader over a whole render target
     ChunkMesher.cs       blocks -> greedy-merged triangles; bakes smooth light + ambient occlusion per vertex
     VoxelVertex.cs       vertex format (position, normal, uv, light)
-    WorldRenderer.cs     frame pipeline: shadows, scene, water (Voxel.fx, Water.fx), present
+    WorldRenderer.cs     frame pipeline: shadows, scene, water (Voxel.fx, Water.fx), post-processing, present
+    PostProcess/         PostProcessor (the effect stack) and Bloom, Vignette, ColorGrade effects (Post.fx)
     DayNightCycle.cs     time of day -> sun direction, light/sky/ambient colours
     CelestialRenderer.cs sun, moon and stars sprites
   Entities/

@@ -2,6 +2,7 @@ using Microsoft.Xna.Framework;
 using Microsoft.Xna.Framework.Content;
 using Microsoft.Xna.Framework.Graphics;
 using VoxelGame.Entities;
+using VoxelGame.Rendering.PostProcess;
 using VoxelGame.Terrain;
 
 namespace VoxelGame.Rendering;
@@ -13,7 +14,7 @@ namespace VoxelGame.Rendering;
 ///   3. DrawTerrain   solid blocks, lit, shadowed and fogged. Caustics appear on anything under water.
 ///   4. DrawWater     the scene is copied, then water is drawn on top, sampling the copy to refract and tint
 ///                    whatever lies behind each water pixel. This is why the terrain pass writes distance into alpha.
-///   5. Present       the finished scene is copied to the screen.
+///   5. Present       the finished scene goes through the post-processing stack (bloom, vignette...) to the screen.
 /// Render-target switches discard the back buffer, which is why everything is built off screen and copied at the end.
 /// </summary>
 public sealed class WorldRenderer : IDisposable
@@ -61,6 +62,9 @@ public sealed class WorldRenderer : IDisposable
     /// <summary>True when the camera is under water: everything gets the murky underwater fog.</summary>
     public bool CameraUnderwater { get; set; }
 
+    /// <summary>Full-screen effects applied to the finished scene. Change the effects' settings any time.</summary>
+    public PostProcessor Post { get; }
+
     public WorldRenderer(GraphicsDevice device, ContentManager content)
     {
         _device = device;
@@ -70,6 +74,7 @@ public sealed class WorldRenderer : IDisposable
         _water = content.Load<Effect>("Shaders/Water");
         _blit = new SpriteBatch(device);
         Ripples = new RippleSimulator(device, content);
+        Post = new PostProcessor(device, content);
 
         // One 32-bit float channel holding the depth of the nearest surface the sun sees.
         _shadowMap = new RenderTarget2D(device, ShadowMapSize, ShadowMapSize, false, SurfaceFormat.Single, DepthFormat.Depth24);
@@ -140,6 +145,7 @@ public sealed class WorldRenderer : IDisposable
         Set(effect, "LightColor", sky.LightColor);
         Set(effect, "AmbientColor", sky.AmbientColor);
         Set(effect, "BlockLightColor", BlockLightColor);
+        Set(effect, "EmissiveIntensity", Post.WantsHdr ? EmissiveBrightness : 1f);
         Set(effect, "FogColor", fog.Color);
         Set(effect, "FogStart", fog.Start);
         Set(effect, "FogEnd", fog.End);
@@ -212,14 +218,13 @@ public sealed class WorldRenderer : IDisposable
         DrawMeshes(world, frustum, water: true, countDrawn: false);
     }
 
-    /// <summary>Stage 5: copies the finished scene to the screen.</summary>
-    public void Present()
+    /// <summary>Stage 5: runs the finished scene through the post-processing stack onto the screen.</summary>
+    public void Present(Camera camera, DayNightCycle sky)
     {
-        _device.SetRenderTarget(null);
-        var bounds = _device.PresentationParameters.Bounds;
-        _blit.Begin(SpriteSortMode.Immediate, BlendState.Opaque, SamplerState.PointClamp, DepthStencilState.None, RasterizerState.CullNone);
-        _blit.Draw(_scene, bounds, Color.White);
-        _blit.End();
+        Post.GodRays.Suppressed = CameraUnderwater;
+        Post.GodRays.Aim(camera, sky);
+        Post.Vignette.Boost = CameraUnderwater ? 0.25f : 0f;   // closing in a little under water
+        Post.Run(_scene);
     }
 
     // ---------------------------------------------------------------- pieces
@@ -228,6 +233,9 @@ public sealed class WorldRenderer : IDisposable
 
     private static Vector3 SnapToGrid(Vector3 p, float step) =>
         new(MathF.Floor(p.X / step) * step, MathF.Floor(p.Y / step) * step, MathF.Floor(p.Z / step) * step);
+
+    /// <summary>How much brighter than white lamp faces are drawn when bloom or tone mapping can make use of it.</summary>
+    private const float EmissiveBrightness = 3f;
 
     private static readonly Vector3 BlockLightColor = new(1.3f, 1.0f, 0.62f);
 
@@ -358,6 +366,7 @@ public sealed class WorldRenderer : IDisposable
     public void Dispose()
     {
         Ripples.Dispose();
+        Post.Dispose();
         _shadowMap.Dispose();
         _scene?.Dispose();
         _refraction?.Dispose();

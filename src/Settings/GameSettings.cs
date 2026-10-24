@@ -21,6 +21,16 @@ public sealed class GameSettings
     public int UiScale { get; set; } = 0;                   // 0 = automatic from the window size
     public bool Fullscreen { get; set; } = false;
     public bool Shadows { get; set; } = true;
+
+    // Post-processing, in percent. 0 turns an effect off.
+    public int Bloom { get; set; } = 40;
+    public int Vignette { get; set; } = 35;
+    public int GodRays { get; set; } = 50;
+    public int Saturation { get; set; } = 100;
+
+    /// <summary>0 = none, 1 = AgX, 2 = AgX punchy.</summary>
+    public int Tonemap { get; set; } = 1;
+    public int TonemapExposure { get; set; } = 100;
     public bool ShowDebugText { get; set; } = true;
     public GameMode GameMode { get; set; } = GameMode.Creative;
 
@@ -70,5 +80,11 @@ public sealed class GameSettings
         FieldOfView = Math.Clamp(FieldOfView, 40, 120);
         MouseSensitivity = Math.Clamp(MouseSensitivity, 10, 300);
         UiScale = Math.Clamp(UiScale, 0, 6);
+        Bloom = Math.Clamp(Bloom, 0, 100);
+        Vignette = Math.Clamp(Vignette, 0, 100);
+        GodRays = Math.Clamp(GodRays, 0, 100);
+        Saturation = Math.Clamp(Saturation, 0, 200);
+        Tonemap = Math.Clamp(Tonemap, 0, 2);
+        TonemapExposure = Math.Clamp(TonemapExposure, 25, 400);
     }
 }
