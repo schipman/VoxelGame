@@ -36,6 +36,9 @@ More test switches: `--fly --lift=N` (hover N blocks above the ground), `--spill
 you), `--rain` (random ripples on nearby water), `--screen=inventory|pause|settings` (open a menu at start),
 `--survival` (start in survival mode).
 
+Multiplayer switches: `--host[=PORT]` (open your world to others as soon as you are in), `--join=ADDRESS[:PORT]`,
+`--name=NAME`, and `--server[=PORT]` (a dedicated server with no window). Launching with no options shows the title screen.
+
 To visit a biome: `dotnet run -- --find=PaleGarden` or `--find=River` (any name from the table below, spaces optional),
 or `--tp=X,Z`.
 The window title shows the biome you are standing in.
@@ -216,10 +219,30 @@ so it reads this working copy; otherwise it reads the copy in `bin/`, refreshed 
 
 - Every launch picks a **new random seed** (shown in the window title and printed in the console). Use
   `--seed=N` to start a specific seed, or to reload a world you saved earlier.
-- Worlds save to `%AppData%\VoxelGame\saves\seed_<N>\`: `level.json` (seed, time of day, player position) and
-  `chunks\c.<x>.<z>.bin` for each chunk you changed. Untouched terrain is regenerated from the seed, so saves stay tiny.
+- Worlds save to `%AppData%\VoxelGame\saves\seed_<N>\`: `level.json` (seed, time of day), `players\<name>.json`
+  (where each player was and what they carried) and `chunks\c.<x>.<z>.bin` for each chunk you changed. Untouched terrain is regenerated from the seed, so saves stay tiny.
 - Saves happen every 30 seconds, when a changed chunk unloads, and on exit. A world you never edited is not saved.
 - Delete a world by deleting its `seed_<N>` folder.
+
+## Multiplayer
+
+The game is a client and a server, even in singleplayer (like Minecraft): `GameServer` (`src/Server/`) owns the real world,
+generates terrain, runs the water, checks every edit and saves; `GameSession` (`src/Client/`) is the player's side, with
+its own copy of the world that the server fills in chunk by chunk. They only talk through messages (`src/Net/`), so it
+makes no difference whether the server is inside your process or on another machine.
+
+- **Play together on a LAN:** one player picks Singleplayer, presses Esc and chooses **Open to LAN**; the pause menu then
+  shows the address(es) to give friends. Others choose **Join game** on the title screen and type the address
+  (add `:port` if it isn't 24454). Over the internet the host must forward **UDP port 24454**.
+- **Dedicated server:** `dotnet run -- --server --seed=1234` (type `stop` to save and quit).
+- **Names:** letters, digits, spaces and underscores, up to 16, set in the join screen or `--name`. Each name has its own
+  saved position and inventory in every world.
+- **Rules the server enforces:** edits must be within reach, in loaded chunks, not into a player, and bedrock can't be
+  broken. A rejected edit is undone on the client. The client moves itself (the server trusts positions), so this is a
+  game for friends, not an anti-cheat design.
+- Networking uses LiteNetLib (UDP). `Message.cs`/`Messages.cs` define the protocol; bump `MessageCodec.ProtocolVersion`
+  when it changes, so mismatched versions refuse to connect with a clear message.
+- Not done yet: other players' block-breaking isn't animated, there is no chat, and no LAN discovery (type the address).
 
 ## Code map
 
@@ -230,6 +253,10 @@ Content/Shaders/Water.fx    water surface shader
 Content/Shaders/Ripples.fx  ripple simulation step
 src/
   VoxelGameApp.cs        Game loop; owns and orders the systems
+  ServerHost.cs          Windowless dedicated server (--server)
+  Net/                   Messages, codec, connections (in-memory and LiteNetLib UDP), chunk compression
+  Server/                GameServer (world authority, 20 ticks/s) and PlayerSession
+  Client/                GameSession (the player's connection and world copy), RemotePlayer
   LaunchOptions.cs       command-line test switches
   Blocks/
     BlockType.cs         enum of every block (1 byte per voxel)
@@ -320,7 +347,8 @@ src/
 - [ ] Mobs and pathfinding (A* over the block grid)
 - [ ] Audio
 - [x] Saving/loading changed chunks, random seed per launch, `--seed` to reload a world
-- [ ] World select / new-world screen with a seed field (needs UI)
+- [x] Client/server split, host and join by IP (LiteNetLib), title screen, world list, remote players
+- [ ] New-world screen with a seed field, chat, LAN discovery
 
 ## Known limitations / future work
 

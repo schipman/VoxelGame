@@ -13,6 +13,7 @@ namespace VoxelGame.Entities;
 ///   Survival: breaking puts the block in the inventory, placing uses one up.
 ///   Creative: nothing is collected or used up.
 /// Number keys and the scroll wheel choose the hotbar slot.
+/// The world belongs to the server, so breaking and placing are requests; the block changes when the server says so.
 /// </summary>
 public sealed class BlockInteraction
 {
@@ -22,7 +23,12 @@ public sealed class BlockInteraction
     // Used by the B shortcut: every block type except air.
     private static readonly BlockType[] AllBlocks = Enum.GetValues<BlockType>().Where(t => t != BlockType.Air).ToArray();
 
+    private const float RequestMemory = 1f;   // seconds to remember asking for an edit, so a slow reply isn't asked for twice
+
     private readonly Inventory _inventory;
+    private readonly Action<bool, int, int, int, BlockType> _requestEdit;
+    private readonly Dictionary<(int, int, int, bool), float> _asked = new();
+    private readonly List<(int, int, int, bool)> _forget = new();
     private float _cooldown;
 
     /// <summary>The block under the crosshair, or null if nothing is within reach.</summary>
@@ -31,15 +37,27 @@ public sealed class BlockInteraction
     /// <summary>The block in hand (Air if the slot is empty).</summary>
     public BlockType HeldBlock => _inventory.Selected.IsEmpty ? BlockType.Air : _inventory.Selected.Block;
 
-    public BlockInteraction(Inventory inventory)
+    /// <param name="requestEdit">Asks the server to break (place = false) or place a block.</param>
+    public BlockInteraction(Inventory inventory, Action<bool, int, int, int, BlockType> requestEdit)
     {
         _inventory = inventory;
+        _requestEdit = requestEdit;
     }
 
     /// <param name="active">False while a menu is open or the mouse is not grabbed: only the targeting is updated.</param>
     public void Update(float dt, InputState input, Camera camera, World world, Player player, GameMode mode, bool active)
     {
         Target = VoxelRaycast.Cast(world, camera.Position, camera.Forward, Reach);
+
+        _forget.Clear();
+        _forget.AddRange(_asked.Keys);
+        foreach (var key in _forget)
+        {
+            float left = _asked[key] - dt;
+            if (left <= 0) _asked.Remove(key);
+            else _asked[key] = left;
+        }
+
         if (!active) { _cooldown = 0; return; }
 
         SelectSlot(input, mode);
@@ -76,8 +94,9 @@ public sealed class BlockInteraction
     {
         var block = world.GetBlock(hit.X, hit.Y, hit.Z);
         if (block == BlockType.Bedrock) return;   // the unbreakable floor
+        if (!_asked.TryAdd((hit.X, hit.Y, hit.Z, false), RequestMemory)) return;
 
-        world.SetBlock(hit.X, hit.Y, hit.Z, BlockType.Air);
+        _requestEdit(false, hit.X, hit.Y, hit.Z, BlockType.Air);
         if (mode == GameMode.Survival) _inventory.Add(block, 1);
     }
 
@@ -91,7 +110,9 @@ public sealed class BlockInteraction
         if (BlockRegistry.Get(world.GetBlock(x, y, z)).IsSolid) return;           // air and water can be built into
         if (BlockRegistry.Get(block).IsSolid && player.OverlapsBlock(x, y, z)) return;   // don't entomb the player
 
-        world.SetBlock(x, y, z, block);
+        if (!_asked.TryAdd((x, y, z, true), RequestMemory)) return;
+
+        _requestEdit(true, x, y, z, block);
         if (mode == GameMode.Survival) _inventory.Remove(_inventory.SelectedSlot, 1);
     }
 }

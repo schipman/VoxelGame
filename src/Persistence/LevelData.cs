@@ -10,6 +10,7 @@ public sealed class LevelData
     public int GeneratorVersion { get; set; }
     public float TimeOfDay { get; set; }
 
+    // Worlds saved before multiplayer kept the one player's state here. Kept so those saves still load; new saves use players/.
     public float PlayerX { get; set; }
     public float PlayerY { get; set; }
     public float PlayerZ { get; set; }

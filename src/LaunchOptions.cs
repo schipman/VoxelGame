@@ -18,6 +18,11 @@ namespace VoxelGame;
 ///   --distance=N  render distance in chunks (overrides the setting; used with --bench)
 ///   --size=WxH    window size in pixels, e.g. --size=2560x1440 (used with --bench to measure pixel cost)
 ///   --lamp        place a lamp on the ground in front of the spawn point
+///   --title       show the title screen (it is also shown when there are no options at all)
+///   --host[=PORT] open the world to other players on a UDP port (default 24454), as soon as you are in
+///   --join=ADDR   join a game: ADDR is an IP or name, optionally with :port
+///   --name=NAME   the name other players see (overrides the setting)
+///   --server[=PORT]  run a dedicated server with no window (also takes --seed, --survival, --distance)
 /// </summary>
 public sealed class LaunchOptions
 {
@@ -37,6 +42,14 @@ public sealed class LaunchOptions
     public int? Distance { get; private set; }
     public (int W, int H)? Size { get; private set; }
     public bool Lamp { get; private set; }
+    public bool Title { get; private set; }
+    public int? HostPort { get; private set; }
+    public string Join { get; private set; }
+    public string Name { get; private set; }
+    public int? ServerPort { get; private set; }
+
+    /// <summary>The title screen shows when asked for, or when the game is started with no options at all.</summary>
+    public bool ShowTitle { get; private set; }
 
     public static LaunchOptions Parse(string[] args)
     {
@@ -75,8 +88,14 @@ public sealed class LaunchOptions
                     if (wh.Length == 2 && int.TryParse(wh[0], out int sw) && int.TryParse(wh[1], out int sh)) options.Size = (sw, sh);
                     break;
                 case "lamp": options.Lamp = true; break;
+                case "title": options.Title = true; break;
+                case "host": options.HostPort = hasValue && int.TryParse(parts[1], out int hp) ? hp : Net.NetDefaults.Port; break;
+                case "join" when hasValue: options.Join = parts[1]; break;
+                case "name" when hasValue: options.Name = parts[1]; break;
+                case "server": options.ServerPort = hasValue && int.TryParse(parts[1], out int sp) ? sp : Net.NetDefaults.Port; break;
             }
         }
+        options.ShowTitle = options.Title || args.Length == 0;
         return options;
     }
 }

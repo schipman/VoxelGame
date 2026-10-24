@@ -24,6 +24,16 @@ public sealed class GameSettings
     public bool ShowDebugText { get; set; } = true;
     public GameMode GameMode { get; set; } = GameMode.Creative;
 
+    /// <summary>The name other players see. Letters, digits, spaces and underscores, up to 16.</summary>
+    public string PlayerName { get; set; } = DefaultName();
+    public string LastServer { get; set; } = "";
+
+    private static string DefaultName()
+    {
+        var name = new string(Environment.UserName.Where(c => char.IsLetterOrDigit(c) || c == '_').Take(16).ToArray());
+        return name.Length > 0 ? name : "Player";
+    }
+
     public static GameSettings Load(string path)
     {
         try
@@ -55,6 +65,8 @@ public sealed class GameSettings
     public void Clamp()
     {
         RenderDistance = Math.Clamp(RenderDistance, 3, 20);
+        PlayerName = Server.GameServer.CleanName(PlayerName) ?? DefaultName();
+        LastServer ??= "";
         FieldOfView = Math.Clamp(FieldOfView, 40, 120);
         MouseSensitivity = Math.Clamp(MouseSensitivity, 10, 300);
         UiScale = Math.Clamp(UiScale, 0, 6);

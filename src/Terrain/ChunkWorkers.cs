@@ -38,6 +38,7 @@ public sealed class ChunkWorkers : IDisposable
     private readonly WorldStorage _storage;
 
     private readonly ConcurrentQueue<(int X, int Z)> _generateQueue = new();
+    private readonly ConcurrentQueue<(int X, int Z, byte[] Data)> _decodeQueue = new();
     private readonly ConcurrentQueue<MeshRequest> _meshQueue = new();
     private readonly ConcurrentQueue<GenerateResult> _generated = new();
     private readonly ConcurrentQueue<MeshRequest> _meshed = new();
@@ -61,6 +62,13 @@ public sealed class ChunkWorkers : IDisposable
     public void RequestGenerate(int chunkX, int chunkZ)
     {
         _generateQueue.Enqueue((chunkX, chunkZ));
+        _work.Release();
+    }
+
+    /// <summary>Unpacks a chunk received from a server (see ChunkCodec) on a worker thread.</summary>
+    public void RequestDecode(int chunkX, int chunkZ, byte[] data)
+    {
+        _decodeQueue.Enqueue((chunkX, chunkZ, data));
         _work.Release();
     }
 
@@ -88,6 +96,13 @@ public sealed class ChunkWorkers : IDisposable
                 {
                     request.Solid = mesher.Build(request.Neighborhood, out request.Water);
                     _meshed.Enqueue(request);
+                }
+                else if (_decodeQueue.TryDequeue(out var packed))
+                {
+                    Chunk decoded = null;
+                    try { decoded = Net.ChunkCodec.Decode(packed.X, packed.Z, packed.Data); }
+                    catch (InvalidDataException e) { Console.WriteLine(e.Message); }
+                    _generated.Enqueue(new GenerateResult { ChunkX = packed.X, ChunkZ = packed.Z, Chunk = decoded });
                 }
                 else if (_generateQueue.TryDequeue(out var at))
                 {

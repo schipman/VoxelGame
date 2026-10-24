@@ -133,6 +133,11 @@ public sealed class Chunk : IDisposable
     public int GetFluidLevel(int x, int y, int z) => _fluid[Index(x, y, z)];
     public void SetFluidLevel(int x, int y, int z, int level) => _fluid[Index(x, y, z)] = (byte)level;
 
+    /// <summary>The river flow field as stored (one byte per column), for sending to clients.</summary>
+    public ReadOnlySpan<byte> FlowCodes => _flow;
+
+    public void LoadFlowCodes(ReadOnlySpan<byte> codes) => codes.CopyTo(_flow);
+
     /// <summary>Direction the river in this column flows, as a unit vector; zero if there is no river.</summary>
     public Vector2 GetFlow(int x, int z)
     {

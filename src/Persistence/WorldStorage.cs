@@ -7,7 +7,8 @@ namespace VoxelGame.Persistence;
 
 /// <summary>
 /// Reads and writes one world's save folder:
-///   level.json              seed, time of day, player position
+///   level.json              seed, time of day
+///   players/{name}.json     where each player was and what they carried
 ///   chunks/c.{x}.{z}.bin    one file per chunk the player has changed
 /// Only changed chunks are stored. Untouched terrain is regenerated from the seed, which keeps saves tiny.
 /// </summary>
@@ -23,6 +24,7 @@ public sealed class WorldStorage
 
     private readonly string _chunkDirectory;
     private readonly string _levelPath;
+    private readonly string _playerDirectory;
 
     public string Directory { get; }
 
@@ -34,6 +36,21 @@ public sealed class WorldStorage
         Directory = Path.Combine(root, $"seed_{seed}");
         _chunkDirectory = Path.Combine(Directory, "chunks");
         _levelPath = Path.Combine(Directory, "level.json");
+        _playerDirectory = Path.Combine(Directory, "players");
+    }
+
+    /// <summary>The saved worlds under a root folder, most recently played first.</summary>
+    public static List<(int Seed, DateTime LastPlayed)> ListWorlds(string root)
+    {
+        var worlds = new List<(int, DateTime)>();
+        if (!System.IO.Directory.Exists(root)) return worlds;
+        foreach (var folder in System.IO.Directory.EnumerateDirectories(root, "seed_*"))
+        {
+            string level = Path.Combine(folder, "level.json");
+            if (File.Exists(level) && int.TryParse(Path.GetFileName(folder)["seed_".Length..], out int seed))
+                worlds.Add((seed, File.GetLastWriteTime(level)));
+        }
+        return worlds.OrderByDescending(w => w.Item2).ToList();
     }
 
     // ---- Level ----
@@ -56,6 +73,40 @@ public sealed class WorldStorage
     {
         System.IO.Directory.CreateDirectory(Directory);
         WriteAtomically(_levelPath, stream => JsonSerializer.Serialize(stream, level, JsonOptions));
+    }
+
+    // ---- Players ----
+
+    /// <summary>True if any player has been saved in this world.</summary>
+    public bool HasPlayers => System.IO.Directory.Exists(_playerDirectory) && System.IO.Directory.EnumerateFiles(_playerDirectory, "*.json").Any();
+
+    /// <summary>A player's saved state, or null if they have never been here (or the file is unreadable).</summary>
+    public PlayerSave LoadPlayer(string name)
+    {
+        string path = PlayerPath(name);
+        if (!File.Exists(path)) return null;
+        try
+        {
+            return JsonSerializer.Deserialize<PlayerSave>(File.ReadAllText(path));
+        }
+        catch (Exception e) when (e is IOException or JsonException)
+        {
+            Console.WriteLine($"Could not read {path}: {e.Message}");
+            return null;
+        }
+    }
+
+    public void SavePlayer(PlayerSave player)
+    {
+        System.IO.Directory.CreateDirectory(_playerDirectory);
+        WriteAtomically(PlayerPath(player.Name), stream => JsonSerializer.Serialize(stream, player, JsonOptions));
+    }
+
+    /// <summary>File name for a player. Names are already restricted to letters, digits, spaces and underscores, but be safe anyway.</summary>
+    private string PlayerPath(string name)
+    {
+        var safe = new string(name.Select(c => char.IsLetterOrDigit(c) || c == '_' || c == ' ' ? c : '_').ToArray());
+        return Path.Combine(_playerDirectory, safe + ".json");
     }
 
     // ---- Chunks ----

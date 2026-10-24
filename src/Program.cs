@@ -1,4 +1,8 @@
 using VoxelGame;
 
-using var game = new VoxelGameApp(LaunchOptions.Parse(args));
+var options = LaunchOptions.Parse(args);
+if (options.ServerPort != null) return ServerHost.Run(options);
+
+using var game = new VoxelGameApp(options);
 game.Run();
+return 0;
