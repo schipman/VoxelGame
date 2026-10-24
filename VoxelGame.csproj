@@ -13,6 +13,14 @@
     <Optimize>true</Optimize>
   </PropertyGroup>
 
+  <!-- The test project lives in tests/ inside this folder; keep its files (and build output) out of the game. -->
+  <ItemGroup>
+    <Compile Remove="tests\**" />
+    <EmbeddedResource Remove="tests\**" />
+    <None Remove="tests\**" />
+    <Content Remove="tests\**" />
+  </ItemGroup>
+
   <ItemGroup>
     <PackageReference Include="MonoGame.Framework.DesktopGL" Version="3.8.*" />
     <PackageReference Include="MonoGame.Content.Builder.Task" Version="3.8.*" />

@@ -261,6 +261,12 @@ makes no difference whether the server is inside your process or on another mach
   when it changes, so mismatched versions refuse to connect with a clear message.
 - Not done yet: other players' block-breaking isn't animated, there is no chat, and no LAN discovery (type the address).
 
+## Tests
+
+`tests/VoxelGame.Tests` is a console project that checks lighting, water, saving, worker threads, networking and the
+server without opening a window. Run everything with `cd tests/VoxelGame.Tests` then `dotnet run -c Release -- all`
+(about 15 seconds); see `tests/README.md` for what each check covers.
+
 ## Code map
 
 ```
